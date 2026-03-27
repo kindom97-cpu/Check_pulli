@@ -623,10 +623,25 @@ def main():
         print("\n✗ Nessun file CSV trovato.")
         sys.exit(1)
 
-    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out = args.output or os.path.join(args.base_dir, f"confronto_PLZ_{ts}.xlsx")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"\n  Elaborazione in corso (max {MAX_DIFF_ROWS:,} righe per foglio DIFF)...")
-    build_excel(families, out)
+
+    if args.output:
+        # output singolo esplicito → tutte le famiglie in un file
+        build_excel(families, args.output)
+    else:
+        # un Excel separato per ogni famiglia (PLZ3A, PLZHA, ...)
+        for family in families:
+            # ricava il prefisso dell'area (es. PLZ3A, PLZHA) dal nome famiglia o dai file
+            area = next(
+                (re.search(r"PLZ\w+", p["logical_name"], re.IGNORECASE).group()
+                 for p in family["pairs"]
+                 if re.search(r"PLZ\w+", p["logical_name"], re.IGNORECASE)),
+                family["name"]
+            )
+            out = os.path.join(args.base_dir, f"confronto_{area}_{ts}.xlsx")
+            build_excel([family], out)
+
     print("  Done.")
 
 
