@@ -630,17 +630,12 @@ def main():
         # output singolo esplicito → tutte le famiglie in un file
         build_excel(families, args.output)
     else:
-        # un Excel separato per ogni famiglia (PLZ3A, PLZHA, ...)
+        # un Excel per ogni singolo file CSV
         for family in families:
-            # ricava il prefisso dell'area (es. PLZ3A, PLZHA) dal nome famiglia o dai file
-            area = next(
-                (re.search(r"PLZ\w+", p["logical_name"], re.IGNORECASE).group()
-                 for p in family["pairs"]
-                 if re.search(r"PLZ\w+", p["logical_name"], re.IGNORECASE)),
-                family["name"]
-            )
-            out = os.path.join(args.base_dir, f"confronto_{area}_{ts}.xlsx")
-            build_excel([family], out)
+            for pair in family["pairs"]:
+                sname = pair["short_name"]
+                out   = os.path.join(args.base_dir, f"confronto_{sname}_{ts}.xlsx")
+                build_excel([{"name": family["name"], "pairs": [pair]}], out)
 
     print("  Done.")
 
