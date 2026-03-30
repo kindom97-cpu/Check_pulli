@@ -229,14 +229,29 @@ def _has_header(filepath):
     return sum(1 for f in fields
                if re.match(r"^[A-Za-z_][A-Za-z0-9_\s]*$", f)) >= max(1, len(fields) * 0.5)
 
+def _dedup_columns(cols):
+    """Rinomina colonne duplicate aggiungendo un suffisso _1, _2, ... per evitare
+    errori 'Cannot index with multidimensional key' durante il confronto."""
+    seen = {}
+    result = []
+    for c in cols:
+        if c in seen:
+            seen[c] += 1
+            result.append(f"{c}_{seen[c]}")
+        else:
+            seen[c] = 0
+            result.append(c)
+    return result
+
 def read_csv(filepath):
     hdr = 0 if _has_header(filepath) else None
     df  = pd.read_csv(filepath, sep=";", header=hdr, dtype=str,
                       encoding="utf-8", encoding_errors="replace",
                       skipinitialspace=True, keep_default_na=False)
-    df  = df.loc[:, df.apply(lambda c: c.str.strip().ne("").any())]
+    # Deduplicazione nomi colonne prima di qualsiasi operazione di indicizzazione
+    df.columns = _dedup_columns([str(c).strip() for c in df.columns])
+    df  = df.loc[:, df.apply(lambda c: c.str.strip().ne("").any()).values]
     df  = df.apply(lambda c: c.str.strip() if c.dtype == object else c)
-    df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
