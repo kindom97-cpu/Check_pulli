@@ -268,8 +268,11 @@ def read_csv(filepath):
                       skipinitialspace=True, keep_default_na=False)
     # Deduplicazione nomi colonne prima di qualsiasi operazione di indicizzazione
     df.columns = _dedup_columns([str(c).strip() for c in df.columns])
-    df  = df.loc[:, df.apply(lambda c: c.str.strip().ne("").any()).values]
-    df  = df.apply(lambda c: c.str.strip() if c.dtype == object else c)
+    # Rimozione colonne completamente vuote tramite list comprehension (evita problemi
+    # di indicizzazione multidimensionale con df.loc su alcune versioni di pandas)
+    non_empty = [c for c in df.columns if df[c].str.strip().ne("").any()]
+    df = df[non_empty] if non_empty else df.iloc[:, :0]
+    df = df.apply(lambda c: c.str.strip() if c.dtype == object else c)
     return df
 
 
