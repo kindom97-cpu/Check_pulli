@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import tempfile
+import traceback
 import warnings
 import zipfile
 from datetime import datetime
@@ -92,6 +93,23 @@ def _title(ws, text, n_cols):
     ws["A1"].fill = _fill(COLOR_HEADER); ws["A1"].font = _font(bold=True, color="FFFFFF", size=12)
     ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 22
+
+
+# ─── Log errori ───────────────────────────────────────────────────────────────
+def _log_error(log_path: str, label: str, exc: Exception) -> None:
+    """Scrive un errore (con traceback completo) nel file di log."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sep = "=" * 70
+    msg = (f"\n{sep}\n"
+           f"[{ts}] ERRORE su: {label}\n"
+           f"Tipo  : {type(exc).__name__}\n"
+           f"Motivo: {exc}\n"
+           f"--- Traceback ---\n"
+           f"{traceback.format_exc()}"
+           f"{sep}\n")
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write(msg)
+    print(f"  [ATTENZIONE]  Errore su {label} — dettagli in: {log_path}")
 
 
 # ─── Rilevamento famiglie PLZ* ────────────────────────────────────────────────
@@ -493,8 +511,10 @@ def compare_rows_chunked(df_a, df_b, key_cols, batch_size=None):
 
 
 # ─── Scrittura Excel ──────────────────────────────────────────────────────────
-def build_excel(all_families: list[dict], output_path: str):
+def build_excel(all_families: list[dict], output_path: str, log_path: str = None):
     import openpyxl
+    if log_path is None:
+        log_path = str(Path(output_path).with_suffix("")) + "_errori.log"
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
@@ -513,64 +533,80 @@ def build_excel(all_families: list[dict], output_path: str):
         fam_name = family["name"]
         for pair in family["pairs"]:
             a_path, t_path = pair["asis_path"], pair["tobe_path"]
-            df_a = read_csv(a_path) if (a_path and a_path.stat().st_size > 0) else pd.DataFrame()
-            df_b = read_csv(t_path) if (t_path and t_path.stat().st_size > 0) else pd.DataFrame()
-            n_a, n_b = len(df_a), len(df_b)
+            label = f"{fam_name} / {pair['logical_name']}"
+            try:
+                df_a = read_csv(a_path) if (a_path and a_path.stat().st_size > 0) else pd.DataFrame()
+                df_b = read_csv(t_path) if (t_path and t_path.stat().st_size > 0) else pd.DataFrame()
+                n_a, n_b = len(df_a), len(df_b)
 
-            strut = col_structure(df_a, df_b) if (not df_a.empty or not df_b.empty) else pd.DataFrame()
-            only_a_cols = strut[strut["STATUS"]=="SOLO AS-IS"]["COLONNA"].tolist() if not strut.empty else []
-            only_b_cols = strut[strut["STATUS"]=="SOLO TO-BE"]["COLONNA"].tolist() if not strut.empty else []
+                strut = col_structure(df_a, df_b) if (not df_a.empty or not df_b.empty) else pd.DataFrame()
+                only_a_cols = strut[strut["STATUS"]=="SOLO AS-IS"]["COLONNA"].tolist() if not strut.empty else []
+                only_b_cols = strut[strut["STATUS"]=="SOLO TO-BE"]["COLONNA"].tolist() if not strut.empty else []
 
-            is_large = max(n_a, n_b) > LARGE_FILE_ROWS
+                is_large = max(n_a, n_b) > LARGE_FILE_ROWS
 
-            if not df_a.empty and not df_b.empty:
-                key_cols   = detect_key(df_a, df_b)
-                common     = [c for c in df_a.columns if c in df_b.columns]
-                value_cols = [c for c in common if c not in key_cols]
-                if is_large:
-                    # confronto a lotti per chiave: evita di materializzare il join completo
-                    both, only_as_rows, only_to_rows, sint, n_diff_rows = compare_rows_chunked(df_a, df_b, key_cols)
-                    cols_w_diff = sint[sint["STATO"]=="DIFFERENZE"]["COLONNA"].tolist() if not sint.empty else []
-                else:
-                    both, only_as_rows, only_to_rows = compare_rows(df_a, df_b, key_cols)
-                    sint = sintesi_colonne(both, key_cols, value_cols)
-                    cols_w_diff = sint[sint["STATO"]=="DIFFERENZE"]["COLONNA"].tolist() if not sint.empty else []
-                    if value_cols and not both.empty:
-                        mask = pd.Series([False]*len(both))
-                        for c in value_cols:
-                            if f"{c}__AS" in both.columns and f"{c}__TO" in both.columns:
-                                mask = mask | (both[f"{c}__AS"].fillna("") != both[f"{c}__TO"].fillna(""))
-                        n_diff_rows = int(mask.sum())
+                if not df_a.empty and not df_b.empty:
+                    key_cols   = detect_key(df_a, df_b)
+                    common     = [c for c in df_a.columns if c in df_b.columns]
+                    value_cols = [c for c in common if c not in key_cols]
+                    if is_large:
+                        both, only_as_rows, only_to_rows, sint, n_diff_rows = compare_rows_chunked(df_a, df_b, key_cols)
+                        cols_w_diff = sint[sint["STATO"]=="DIFFERENZE"]["COLONNA"].tolist() if not sint.empty else []
                     else:
-                        n_diff_rows = 0
-            else:
-                is_large=False; key_cols=value_cols=[]; both=pd.DataFrame()
-                only_as_rows=df_a.copy(); only_to_rows=df_b.copy()
-                sint=pd.DataFrame(); cols_w_diff=[]; n_diff_rows=0
+                        both, only_as_rows, only_to_rows = compare_rows(df_a, df_b, key_cols)
+                        sint = sintesi_colonne(both, key_cols, value_cols)
+                        cols_w_diff = sint[sint["STATO"]=="DIFFERENZE"]["COLONNA"].tolist() if not sint.empty else []
+                        if value_cols and not both.empty:
+                            mask = pd.Series([False]*len(both))
+                            for c in value_cols:
+                                if f"{c}__AS" in both.columns and f"{c}__TO" in both.columns:
+                                    mask = mask | (both[f"{c}__AS"].fillna("") != both[f"{c}__TO"].fillna(""))
+                            n_diff_rows = int(mask.sum())
+                        else:
+                            n_diff_rows = 0
+                else:
+                    is_large=False; key_cols=value_cols=[]; both=pd.DataFrame()
+                    only_as_rows=df_a.copy(); only_to_rows=df_b.copy()
+                    sint=pd.DataFrame(); cols_w_diff=[]; n_diff_rows=0
 
-            all_pair_data.append({**pair,
-                "family": fam_name, "is_large": is_large,
-                "n_a": n_a, "n_b": n_b,
-                "df_a": df_a, "df_b": df_b,
-                "strut": strut, "sint": sint,
-                "key_cols": key_cols, "value_cols": value_cols, "both": both,
-                "only_as_rows": only_as_rows, "only_to_rows": only_to_rows,
-                "only_a_cols": only_a_cols, "only_b_cols": only_b_cols,
-                "cols_w_diff": cols_w_diff, "n_diff_rows": n_diff_rows,
-            })
+                all_pair_data.append({**pair,
+                    "family": fam_name, "is_large": is_large,
+                    "n_a": n_a, "n_b": n_b,
+                    "df_a": df_a, "df_b": df_b,
+                    "strut": strut, "sint": sint,
+                    "key_cols": key_cols, "value_cols": value_cols, "both": both,
+                    "only_as_rows": only_as_rows, "only_to_rows": only_to_rows,
+                    "only_a_cols": only_a_cols, "only_b_cols": only_b_cols,
+                    "cols_w_diff": cols_w_diff, "n_diff_rows": n_diff_rows,
+                    "error": None,
+                })
 
-            ok = (not only_a_cols and not only_b_cols and n_diff_rows==0 and n_a==n_b)
-            ws_r.append([
-                fam_name, pair["logical_name"],
-                a_path.name if a_path else "— MANCANTE —",
-                t_path.name if t_path else "— MANCANTE —",
-                n_a, n_b, n_a-n_b,
-                ", ".join(only_a_cols) or "—",
-                ", ".join(only_b_cols) or "—",
-                ", ".join(cols_w_diff) or "—",
-                n_diff_rows,
-            ])
-            _row(ws_r, ws_r.max_row, COLOR_OK if ok else COLOR_KO)
+                ok = (not only_a_cols and not only_b_cols and n_diff_rows==0 and n_a==n_b)
+                ws_r.append([
+                    fam_name, pair["logical_name"],
+                    a_path.name if a_path else "— MANCANTE —",
+                    t_path.name if t_path else "— MANCANTE —",
+                    n_a, n_b, n_a-n_b,
+                    ", ".join(only_a_cols) or "—",
+                    ", ".join(only_b_cols) or "—",
+                    ", ".join(cols_w_diff) or "—",
+                    n_diff_rows,
+                ])
+                _row(ws_r, ws_r.max_row, COLOR_OK if ok else COLOR_KO)
+
+            except Exception as exc:
+                _log_error(log_path, label, exc)
+                all_pair_data.append({**pair,
+                    "family": fam_name, "error": str(exc),
+                    "n_a": 0, "n_b": 0,
+                })
+                ws_r.append([
+                    fam_name, pair["logical_name"],
+                    a_path.name if a_path else "— MANCANTE —",
+                    t_path.name if t_path else "— MANCANTE —",
+                    "ERRORE", "ERRORE", "—", "—", "—", "—", str(exc),
+                ])
+                _row(ws_r, ws_r.max_row, COLOR_WARN)
 
     _autofit(ws_r); ws_r.freeze_panes = "A3"
 
@@ -587,117 +623,138 @@ def build_excel(all_families: list[dict], output_path: str):
             used_snames[raw_sname] = 0
             sname = raw_sname
 
-        strut=pd_["strut"]; sint=pd_["sint"]; both=pd_["both"]
-        only_as=pd_["only_as_rows"]; only_to=pd_["only_to_rows"]
-        key_cols=pd_["key_cols"]; value_cols=pd_["value_cols"]; lname=pd_["logical_name"]
-        fam=pd_["family"]; is_large=pd_["is_large"]
-        n_a=pd_["n_a"]; n_b=pd_["n_b"]; n_diff_rows=pd_["n_diff_rows"]
+        lname = pd_["logical_name"]
+        fam   = pd_["family"]
+        label = f"{fam} / {lname}"
 
-        # ── STRUTTURA ────────────────────────────────────────────────────────
-        ws_s = wb.create_sheet(f"STRUTTURA_{sname}")
-        _title(ws_s, f"[{fam}] Struttura colonne – {lname}", 9)
-        if strut.empty:
-            ws_s.append(["(nessun dato)"])
-        else:
-            ws_s.append(list(strut.columns)); _hdr(ws_s, 2, COLOR_SUBHDR)
-            for _, r in strut.iterrows():
-                ws_s.append(list(r)); rn = ws_s.max_row; _row(ws_s, rn)
-                st=str(r.get("STATUS","")); tc=str(r.get("TIPO COERENTE","Sì"))
-                if   st=="SOLO AS-IS": _row(ws_s, rn, COLOR_ONLY_AS)
-                elif st=="SOLO TO-BE": _row(ws_s, rn, COLOR_ONLY_TO)
-                elif tc=="No":         _row(ws_s, rn, COLOR_WARN)
-        _autofit(ws_s); ws_s.freeze_panes = "A3"
+        # Se la coppia ha già dato errore in fase 1, scrivi uno sheet di errore e vai avanti
+        if pd_.get("error"):
+            ws_err = wb.create_sheet(f"ERRORE_{sname}")
+            _title(ws_err, f"[{fam}] ERRORE – {lname}", 1)
+            ws_err.append([f"Errore durante l'elaborazione: {pd_['error']}"])
+            ws_err.append(["Consultare il file di log per il traceback completo."])
+            _row(ws_err, 2, COLOR_WARN)
+            continue
 
-        # ── SINTESI COLONNE ───────────────────────────────────────────────────
-        ws_sc = wb.create_sheet(f"SINTESI_COL_{sname}")
-        _title(ws_sc, f"[{fam}] Sintesi differenze per colonna – {lname}", 7)
-        if sint.empty:
-            ws_sc.append(["(nessun dato comparabile)"])
-        else:
-            ws_sc.append(list(sint.columns)); _hdr(ws_sc, 2, COLOR_SUBHDR)
-            for _, r in sint.iterrows():
-                ws_sc.append(list(r)); rn=ws_sc.max_row
-                _row(ws_sc, rn, COLOR_KO if str(r.get("STATO",""))=="DIFFERENZE" else COLOR_OK)
-        _autofit(ws_sc); ws_sc.freeze_panes = "A3"
+        try:
+            strut=pd_["strut"]; sint=pd_["sint"]; both=pd_["both"]
+            only_as=pd_["only_as_rows"]; only_to=pd_["only_to_rows"]
+            key_cols=pd_["key_cols"]; value_cols=pd_["value_cols"]
+            is_large=pd_["is_large"]
+            n_a=pd_["n_a"]; n_b=pd_["n_b"]; n_diff_rows=pd_["n_diff_rows"]
 
-        # ── DIFF WIDE ─────────────────────────────────────────────────────────
-        ws_d = wb.create_sheet(f"DIFF_{sname}")
-        if both.empty or not value_cols:
-            _title(ws_d, f"[{fam}] Differenze – {lname}", 1)
-            ws_d.append(["(nessuna riga comparabile)"])
-        else:
-            mask = pd.Series([False]*len(both))
-            for c in value_cols:
-                ca, cb = f"{c}__AS", f"{c}__TO"
-                if ca in both.columns and cb in both.columns:
-                    mask = mask | (both[ca].fillna("") != both[cb].fillna(""))
-            diff_df = both[mask].reset_index(drop=True)
-            # per file grandi both è già cappato: usa n_diff_rows (conteggio reale non cappato)
-            total_diff = n_diff_rows if is_large else int(mask.sum())
-            truncated = total_diff > MAX_DIFF_ROWS
-            if len(diff_df) > MAX_DIFF_ROWS:
-                diff_df = diff_df.head(MAX_DIFF_ROWS)
+            # ── STRUTTURA ────────────────────────────────────────────────────────
+            ws_s = wb.create_sheet(f"STRUTTURA_{sname}")
+            _title(ws_s, f"[{fam}] Struttura colonne – {lname}", 9)
+            if strut.empty:
+                ws_s.append(["(nessun dato)"])
+            else:
+                ws_s.append(list(strut.columns)); _hdr(ws_s, 2, COLOR_SUBHDR)
+                for _, r in strut.iterrows():
+                    ws_s.append(list(r)); rn = ws_s.max_row; _row(ws_s, rn)
+                    st=str(r.get("STATUS","")); tc=str(r.get("TIPO COERENTE","Sì"))
+                    if   st=="SOLO AS-IS": _row(ws_s, rn, COLOR_ONLY_AS)
+                    elif st=="SOLO TO-BE": _row(ws_s, rn, COLOR_ONLY_TO)
+                    elif tc=="No":         _row(ws_s, rn, COLOR_WARN)
+            _autofit(ws_s); ws_s.freeze_panes = "A3"
 
-            note = (f" — prime {MAX_DIFF_ROWS:,} su {total_diff:,} righe con diff"
-                    if truncated else f" — {len(diff_df):,} righe con diff")
-            headers = list(key_cols)
-            for c in value_cols:
-                headers += [f"{c} [AS-IS]", f"{c} [TO-BE]", f"DIFF {c}"]
+            # ── SINTESI COLONNE ───────────────────────────────────────────────────
+            ws_sc = wb.create_sheet(f"SINTESI_COL_{sname}")
+            _title(ws_sc, f"[{fam}] Sintesi differenze per colonna – {lname}", 7)
+            if sint.empty:
+                ws_sc.append(["(nessun dato comparabile)"])
+            else:
+                ws_sc.append(list(sint.columns)); _hdr(ws_sc, 2, COLOR_SUBHDR)
+                for _, r in sint.iterrows():
+                    ws_sc.append(list(r)); rn=ws_sc.max_row
+                    _row(ws_sc, rn, COLOR_KO if str(r.get("STATO",""))=="DIFFERENZE" else COLOR_OK)
+            _autofit(ws_sc); ws_sc.freeze_panes = "A3"
 
-            _title(ws_d, f"[{fam}] Differenze riga×colonna – {lname}{note}", len(headers))
-            ws_d.append(headers); _hdr(ws_d, 2, COLOR_SUBHDR)
-            for idx, k in enumerate(key_cols):
-                ws_d.cell(row=2, column=idx+1).fill = _fill(COLOR_KEY_HDR)
-
-            for _, r in diff_df.iterrows():
-                row_vals = [r.get(k,"") for k in key_cols]
+            # ── DIFF WIDE ─────────────────────────────────────────────────────────
+            ws_d = wb.create_sheet(f"DIFF_{sname}")
+            if both.empty or not value_cols:
+                _title(ws_d, f"[{fam}] Differenze – {lname}", 1)
+                ws_d.append(["(nessuna riga comparabile)"])
+            else:
+                mask = pd.Series([False]*len(both))
                 for c in value_cols:
-                    va = r.get(f"{c}__AS",""); vb = r.get(f"{c}__TO","")
-                    row_vals += [va, vb, _num_diff(va, vb)]
-                ws_d.append(row_vals); rn = ws_d.max_row; _row(ws_d, rn)
-                col_offset = len(key_cols) + 1
+                    ca, cb = f"{c}__AS", f"{c}__TO"
+                    if ca in both.columns and cb in both.columns:
+                        mask = mask | (both[ca].fillna("") != both[cb].fillna(""))
+                diff_df = both[mask].reset_index(drop=True)
+                total_diff = n_diff_rows if is_large else int(mask.sum())
+                truncated = total_diff > MAX_DIFF_ROWS
+                if len(diff_df) > MAX_DIFF_ROWS:
+                    diff_df = diff_df.head(MAX_DIFF_ROWS)
+
+                note = (f" — prime {MAX_DIFF_ROWS:,} su {total_diff:,} righe con diff"
+                        if truncated else f" — {len(diff_df):,} righe con diff")
+                headers = list(key_cols)
                 for c in value_cols:
-                    if str(r.get(f"{c}__AS","")).strip() != str(r.get(f"{c}__TO","")).strip():
-                        ws_d.cell(rn, col_offset).fill     = _fill(COLOR_DIFF)
-                        ws_d.cell(rn, col_offset+1).fill   = _fill(COLOR_DIFF)
-                    col_offset += 3
+                    headers += [f"{c} [AS-IS]", f"{c} [TO-BE]", f"DIFF {c}"]
 
-        _autofit(ws_d)
-        if key_cols:
-            ws_d.freeze_panes = f"{get_column_letter(len(key_cols)+1)}3"
+                _title(ws_d, f"[{fam}] Differenze rigaxcolonna – {lname}{note}", len(headers))
+                ws_d.append(headers); _hdr(ws_d, 2, COLOR_SUBHDR)
+                for idx, k in enumerate(key_cols):
+                    ws_d.cell(row=2, column=idx+1).fill = _fill(COLOR_KEY_HDR)
 
-        # ── SOLO AS-IS ────────────────────────────────────────────────────────
-        ws_a = wb.create_sheet(f"SOLO_ASIS_{sname}")
-        nc = max(len(only_as.columns),1)
-        only_as_show = only_as.head(MAX_ONLY_ROWS)
-        trunc_a = len(only_as) > MAX_ONLY_ROWS
-        _title(ws_a, f"[{fam}] Solo in AS-IS – {lname}"
-               + (f" (prime {MAX_ONLY_ROWS:,} di {len(only_as):,})" if trunc_a else ""), nc)
-        if only_as_show.empty:
-            ws_a.append(["(nessuna riga esclusiva)"])
-        else:
-            ws_a.append(list(only_as_show.columns)); _hdr(ws_a, 2, COLOR_SUBHDR)
-            for _, r in only_as_show.iterrows():
-                ws_a.append(list(r)); _row(ws_a, ws_a.max_row, COLOR_ONLY_AS)
-        _autofit(ws_a)
+                for _, r in diff_df.iterrows():
+                    row_vals = [r.get(k,"") for k in key_cols]
+                    for c in value_cols:
+                        va = r.get(f"{c}__AS",""); vb = r.get(f"{c}__TO","")
+                        row_vals += [va, vb, _num_diff(va, vb)]
+                    ws_d.append(row_vals); rn = ws_d.max_row; _row(ws_d, rn)
+                    col_offset = len(key_cols) + 1
+                    for c in value_cols:
+                        if str(r.get(f"{c}__AS","")).strip() != str(r.get(f"{c}__TO","")).strip():
+                            ws_d.cell(rn, col_offset).fill     = _fill(COLOR_DIFF)
+                            ws_d.cell(rn, col_offset+1).fill   = _fill(COLOR_DIFF)
+                        col_offset += 3
 
-        # ── SOLO TO-BE ────────────────────────────────────────────────────────
-        ws_t = wb.create_sheet(f"SOLO_TOBE_{sname}")
-        nc = max(len(only_to.columns),1)
-        only_to_show = only_to.head(MAX_ONLY_ROWS)
-        trunc_t = len(only_to) > MAX_ONLY_ROWS
-        _title(ws_t, f"[{fam}] Solo in TO-BE – {lname}"
-               + (f" (prime {MAX_ONLY_ROWS:,} di {len(only_to):,})" if trunc_t else ""), nc)
-        if only_to_show.empty:
-            ws_t.append(["(nessuna riga esclusiva)"])
-        else:
-            ws_t.append(list(only_to_show.columns)); _hdr(ws_t, 2, COLOR_SUBHDR)
-            for _, r in only_to_show.iterrows():
-                ws_t.append(list(r)); _row(ws_t, ws_t.max_row, COLOR_ONLY_TO)
-        _autofit(ws_t)
+            _autofit(ws_d)
+            if key_cols:
+                ws_d.freeze_panes = f"{get_column_letter(len(key_cols)+1)}3"
+
+            # ── SOLO AS-IS ────────────────────────────────────────────────────────
+            ws_a = wb.create_sheet(f"SOLO_ASIS_{sname}")
+            nc = max(len(only_as.columns),1)
+            only_as_show = only_as.head(MAX_ONLY_ROWS)
+            trunc_a = len(only_as) > MAX_ONLY_ROWS
+            _title(ws_a, f"[{fam}] Solo in AS-IS – {lname}"
+                   + (f" (prime {MAX_ONLY_ROWS:,} di {len(only_as):,})" if trunc_a else ""), nc)
+            if only_as_show.empty:
+                ws_a.append(["(nessuna riga esclusiva)"])
+            else:
+                ws_a.append(list(only_as_show.columns)); _hdr(ws_a, 2, COLOR_SUBHDR)
+                for _, r in only_as_show.iterrows():
+                    ws_a.append(list(r)); _row(ws_a, ws_a.max_row, COLOR_ONLY_AS)
+            _autofit(ws_a)
+
+            # ── SOLO TO-BE ────────────────────────────────────────────────────────
+            ws_t = wb.create_sheet(f"SOLO_TOBE_{sname}")
+            nc = max(len(only_to.columns),1)
+            only_to_show = only_to.head(MAX_ONLY_ROWS)
+            trunc_t = len(only_to) > MAX_ONLY_ROWS
+            _title(ws_t, f"[{fam}] Solo in TO-BE – {lname}"
+                   + (f" (prime {MAX_ONLY_ROWS:,} di {len(only_to):,})" if trunc_t else ""), nc)
+            if only_to_show.empty:
+                ws_t.append(["(nessuna riga esclusiva)"])
+            else:
+                ws_t.append(list(only_to_show.columns)); _hdr(ws_t, 2, COLOR_SUBHDR)
+                for _, r in only_to_show.iterrows():
+                    ws_t.append(list(r)); _row(ws_t, ws_t.max_row, COLOR_ONLY_TO)
+            _autofit(ws_t)
+
+        except Exception as exc:
+            _log_error(log_path, f"{label} (scrittura sheet)", exc)
+            ws_err = wb.create_sheet(f"ERRORE_{sname}")
+            _title(ws_err, f"[{fam}] ERRORE scrittura sheet – {lname}", 1)
+            ws_err.append([f"Errore durante la scrittura: {exc}"])
+            ws_err.append(["Consultare il file di log per il traceback completo."])
+            _row(ws_err, 2, COLOR_WARN)
 
     wb.save(output_path)
-    print(f"\n✓ Excel salvato in: {output_path}")
+    print(f"\n[OK] Excel salvato in: {output_path}")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -722,7 +779,7 @@ def main():
         # auto-detect
         groups = find_pairs(args.base_dir, args.prefix)
         if not groups:
-            print("\n✗ Nessuna cartella/zip PLZ* trovata.")
+            print("\n[ERRORE] Nessuna cartella/zip PLZ* trovata.")
             sys.exit(1)
         families = []
         for pfx, slots in sorted(groups.items()):
@@ -730,8 +787,8 @@ def main():
             tobe_src = slots.get("tobe")
             fam_label = pfx.split(".")[-1] if "." in pfx else pfx
             print(f"\n  [{fam_label}]")
-            print(f"    AS-IS : {asis_src or '⚠  NON TROVATA'}")
-            print(f"    TO-BE : {tobe_src or '⚠  NON TROVATA'}")
+            print(f"    AS-IS : {asis_src or '[ATTENZIONE]  NON TROVATA'}")
+            print(f"    TO-BE : {tobe_src or '[ATTENZIONE]  NON TROVATA'}")
             pairs = match_files(asis_src, tobe_src)
             if pairs:
                 print(f"    File CSV: {len(pairs)}")
@@ -742,24 +799,38 @@ def main():
                 families.append({"name": fam_label, "pairs": pairs})
 
     if not families:
-        print("\n✗ Nessun file CSV trovato.")
+        print("\n[ERRORE] Nessun file CSV trovato.")
         sys.exit(1)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(args.base_dir, f"confronto_errori_{ts}.log")
     print(f"\n  Elaborazione in corso (max {MAX_DIFF_ROWS:,} righe per foglio DIFF)...")
+    print(f"  Log errori    : {log_path}")
 
     if args.output:
         # output singolo esplicito → tutte le famiglie in un file
-        build_excel(families, args.output)
+        try:
+            build_excel(families, args.output, log_path=log_path)
+        except Exception as exc:
+            _log_error(log_path, args.output, exc)
+            print(f"\n[ERRORE] Errore fatale durante la generazione dell'Excel: {exc}")
+            print(f"  Dettagli nel log: {log_path}")
+            sys.exit(1)
     else:
         # un Excel per ogni singolo file CSV
         for family in families:
             for pair in family["pairs"]:
                 sname = pair["short_name"]
                 out   = os.path.join(args.base_dir, f"confronto_{sname}_{ts}.xlsx")
-                build_excel([{"name": family["name"], "pairs": [pair]}], out)
+                try:
+                    build_excel([{"name": family["name"], "pairs": [pair]}], out, log_path=log_path)
+                except Exception as exc:
+                    _log_error(log_path, out, exc)
+                    print(f"  [ERRORE] Skippato {sname} — vedi log per dettagli.")
 
     print("  Done.")
+    if os.path.exists(log_path):
+        print(f"  [ATTENZIONE]  Alcuni file hanno generato errori. Consultare: {log_path}")
 
 
 if __name__ == "__main__":
