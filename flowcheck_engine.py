@@ -231,15 +231,19 @@ def read_csv(filepath: str | Path, sep: str | None = None) -> pd.DataFrame:
 def _is_artifact_col(col_name: str) -> bool:
     """
     True se il nome colonna e' un artefatto del separatore CSV e va scartato:
-    - stringa vuota  (es. trailing ';' -> '')
-    - solo caratteri speciali non-word  (es. '#', '£', '|', ';#', ';£')
-    I nomi legittimi contengono almeno una lettera, cifra o underscore.
+    - stringa vuota           (es. trailing ';' -> '')
+    - solo caratteri speciali (es. '#', '£', '|', ';#', ';£')
+    - auto-nome pandas        (es. 'Unnamed: 33') generato da trailing sep
+      quando l'header ha un separatore finale ma i dati no
     """
     stripped = col_name.strip()
     if not stripped:
         return True
     # nessun carattere \w (lettera, cifra, _) -> artefatto
     if not re.search(r"\w", stripped):
+        return True
+    # pandas auto-naming per colonne senza nome: 'Unnamed: N'
+    if re.match(r"^Unnamed:\s*\d+$", stripped, re.IGNORECASE):
         return True
     return False
 
