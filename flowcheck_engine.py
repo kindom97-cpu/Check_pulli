@@ -219,6 +219,7 @@ def read_csv(filepath: str | Path, sep: str | None = None) -> pd.DataFrame:
         encoding_errors="replace",
         skipinitialspace=True,
         keep_default_na=False,
+        on_bad_lines="skip",
         engine=engine,
     )
     df.columns = _dedup_columns([str(c).strip() for c in df.columns])
@@ -271,6 +272,7 @@ def read_csv_from_zip(zip_path: str | Path, csv_name: str, sep: str | None = Non
         encoding_errors="replace",
         skipinitialspace=True,
         keep_default_na=False,
+        on_bad_lines="skip",
         engine=engine,
     )
     df.columns = _dedup_columns([str(c).strip() for c in df.columns])
