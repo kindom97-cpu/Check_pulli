@@ -99,6 +99,26 @@ def _read_first_lines(filepath: Path, n: int = 30) -> list[str]:
 # Lettura CSV (con auto-detect del separatore)
 # ---------------------------------------------------------------------------
 
+def _clean_str_series(s: pd.Series) -> pd.Series:
+    """
+    Normalizza una Series di stringhe per la lettura e il confronto:
+    - strip leading/trailing whitespace ASCII
+    - rimuove spazi non-breaking (U+00A0) da bordi
+    - collassa spazi interni multipli in uno singolo
+    """
+    return (
+        s.str.strip()
+         .str.replace("\xa0", " ", regex=False)   # non-breaking space -> spazio
+         .str.replace(r"[ \t]+", " ", regex=True)  # spazi/tab multipli -> singolo
+         .str.strip()
+    )
+
+
+def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Applica _clean_str_series a tutte le colonne stringa del DataFrame."""
+    return df.apply(lambda col: _clean_str_series(col) if col.dtype == object else col)
+
+
 def _dedup_columns(cols: list[str]) -> list[str]:
     seen: dict[str, int] = {}
     result = []
@@ -156,7 +176,7 @@ def read_csv(filepath: str | Path, sep: str | None = None) -> pd.DataFrame:
     df.columns = _dedup_columns([str(c).strip() for c in df.columns])
     # Rimuovi SOLO colonne con nome vuoto (artefatti di trailing sep)
     df = df[[c for c in df.columns if c != ""]]
-    df = df.apply(lambda col: col.str.strip() if col.dtype == object else col)
+    df = _clean_df(df)
     return df
 
 
@@ -186,7 +206,7 @@ def read_csv_from_zip(zip_path: str | Path, csv_name: str, sep: str | None = Non
     )
     df.columns = _dedup_columns([str(c).strip() for c in df.columns])
     df = df[[c for c in df.columns if c != ""]]
-    df = df.apply(lambda col: col.str.strip() if col.dtype == object else col)
+    df = _clean_df(df)
     return df
 
 
@@ -336,8 +356,12 @@ def compare_dataframes(
         min_rows = min(len(df_a), len(df_b))
         common_df_a = df_a[cols_common].iloc[:min_rows].reset_index(drop=True)
         common_df_b = df_b[cols_common].iloc[:min_rows].reset_index(drop=True)
-        diff_mask = (common_df_a != common_df_b)
+        # Confronto su valori normalizzati (elimina falsi positivi da spazi)
+        norm_a = _clean_df(common_df_a)
+        norm_b = _clean_df(common_df_b)
+        diff_mask = (norm_a != norm_b)
         diff_rows_idx = diff_mask.any(axis=1)
+        # Nel report mostra i valori originali (non normalizzati)
         df_diff_a = common_df_a[diff_rows_idx].head(max_diff_rows)
         df_diff_b = common_df_b[diff_rows_idx].head(max_diff_rows)
         df_only_a = df_a.iloc[min_rows:].head(max_diff_rows) if len(df_a) > min_rows else pd.DataFrame()
@@ -345,23 +369,33 @@ def compare_dataframes(
         n_diff = int(diff_rows_idx.sum())
         key_used = []
     else:
-        # Confronto per chiave
+        # Confronto per chiave — merge sui valori normalizzati della chiave
+        df_a_norm = df_a.copy()
+        df_b_norm = df_b.copy()
+        for k in join_key:
+            if k in df_a_norm.columns:
+                df_a_norm[k] = _clean_str_series(df_a_norm[k].astype(str))
+            if k in df_b_norm.columns:
+                df_b_norm[k] = _clean_str_series(df_b_norm[k].astype(str))
+
         merged = pd.merge(
-            df_a[cols_common + [c for c in cols_only_a]],
-            df_b[cols_common + [c for c in cols_only_b]],
+            df_a_norm[cols_common + [c for c in cols_only_a]],
+            df_b_norm[cols_common + [c for c in cols_only_b]],
             on=join_key, how="outer", indicator=True, suffixes=("__A", "__B"),
         )
         df_only_a = merged[merged["_merge"] == "left_only"].drop(columns=["_merge"]).head(max_diff_rows)
         df_only_b = merged[merged["_merge"] == "right_only"].drop(columns=["_merge"]).head(max_diff_rows)
         both = merged[merged["_merge"] == "both"].drop(columns=["_merge"])
 
-        # Trova colonne confrontabili (non di join)
+        # Confronto colonne non-chiave su valori normalizzati
         compare_cols = [c for c in cols_common if c not in join_key]
         diff_rows_mask = pd.Series(False, index=both.index)
         for c in compare_cols:
             ca, cb = f"{c}__A", f"{c}__B"
             if ca in both.columns and cb in both.columns:
-                diff_rows_mask |= (both[ca].fillna("") != both[cb].fillna(""))
+                val_a = _clean_str_series(both[ca].fillna("").astype(str))
+                val_b = _clean_str_series(both[cb].fillna("").astype(str))
+                diff_rows_mask |= (val_a != val_b)
         df_diff_a = both[diff_rows_mask][join_key + [f"{c}__A" for c in compare_cols if f"{c}__A" in both.columns]].head(max_diff_rows)
         df_diff_b = both[diff_rows_mask][join_key + [f"{c}__B" for c in compare_cols if f"{c}__B" in both.columns]].head(max_diff_rows)
         n_diff = int(diff_rows_mask.sum())
