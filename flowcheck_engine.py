@@ -492,43 +492,204 @@ def compare_dataframes(
 
 
 # ---------------------------------------------------------------------------
-# Scrittura Excel
+# Stili Excel (palette originale)
+# ---------------------------------------------------------------------------
+_C_HEADER   = "1F4E79"   # blu scuro
+_C_SUBHDR   = "2E75B6"   # blu medio
+_C_KEY_HDR  = "4472C4"   # blu chiave
+_C_DIFF     = "FFE699"   # giallo differenze
+_C_ONLY_AS  = "F4CCCC"   # rosa solo AS-IS
+_C_ONLY_TO  = "D9EAD3"   # verde chiaro solo TO-BE
+_C_OK       = "E2EFDA"   # verde ok
+_C_KO       = "FCE4D6"   # arancio ko
+_C_WARN     = "FFF2CC"   # giallo warn
+
+
+def _xl_fill(c):
+    return PatternFill("solid", fgColor=c)
+
+def _xl_font(bold=False, color="000000", size=10):
+    return Font(bold=bold, color=color, size=size)
+
+def _xl_border():
+    s = Side(style="thin")
+    return Border(left=s, right=s, top=s, bottom=s)
+
+def _xl_title(ws, text: str, n_cols: int):
+    """Riga titolo blu scuro, merge su n_cols colonne."""
+    ws.append([text])
+    if n_cols > 1:
+        ws.merge_cells(start_row=1, start_column=1,
+                       end_row=1, end_column=n_cols)
+    cell = ws["A1"]
+    cell.fill = _xl_fill(_C_HEADER)
+    cell.font = _xl_font(bold=True, color="FFFFFF", size=12)
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 22
+
+def _xl_hdr_row(ws, row_idx: int, bg: str = _C_SUBHDR, fg: str = "FFFFFF"):
+    """Applica stile intestazione a una riga."""
+    for cell in ws[row_idx]:
+        if cell.value is not None:
+            cell.fill = _xl_fill(bg)
+            cell.font = _xl_font(bold=True, color=fg)
+            cell.border = _xl_border()
+            cell.alignment = Alignment(horizontal="center",
+                                       vertical="center", wrap_text=True)
+
+def _xl_data_row(ws, row_idx: int, bg: str | None = None):
+    """Applica bordo (e colore opzionale) a una riga dati."""
+    for cell in ws[row_idx]:
+        cell.border = _xl_border()
+        cell.alignment = Alignment(vertical="center")
+        if bg:
+            cell.fill = _xl_fill(bg)
+
+def _xl_autofit(ws, mn: int = 8, mx: int = 50):
+    for col in ws.columns:
+        w = max((len(str(c.value)) if c.value is not None else 0) for c in col)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max(w + 2, mn), mx)
+
+
+# ---------------------------------------------------------------------------
+# Helpers analisi dati
 # ---------------------------------------------------------------------------
 
-def _write_df_to_sheet(ws, df: pd.DataFrame, header_label: str,
-                        header_bg: str, header_fg: str,
-                        row_bg: str | None = None, row_fg: str | None = None):
-    """Scrive un DataFrame in un worksheet openpyxl gia' creato."""
-    if df.empty:
-        ws.append(["(nessuna riga)"])
-        return
+def _infer_type(series: pd.Series) -> str:
+    """Inferisce il tipo semantico di una colonna: VUOTO, INTERO, DECIMALE, DATA, TESTO."""
+    s = series.dropna().head(200)
+    if s.empty:
+        return "VUOTO"
+    num_frac = pd.to_numeric(s, errors="coerce").notna().mean()
+    if num_frac > 0.9:
+        return "DECIMALE" if s.str.contains(r"\.", na=False).any() else "INTERO"
+    try:
+        pd.to_datetime(s, dayfirst=True, errors="raise")
+        return "DATA"
+    except Exception:
+        pass
+    return "TESTO"
 
-    # Intestazione
-    for ci, col in enumerate(df.columns, 1):
-        cell = ws.cell(row=1, column=ci, value=str(col))
-        cell.fill = _fill(header_bg)
-        cell.font = _font(header_fg, bold=True)
-        cell.alignment = Alignment(horizontal="center", wrap_text=True)
-        cell.border = _border
 
-    # Righe
-    for ri, (_, row) in enumerate(df.iterrows(), 2):
-        for ci, val in enumerate(row, 1):
-            cell = ws.cell(row=ri, column=ci, value=str(val) if pd.notna(val) else "")
-            if row_bg:
-                cell.fill = _fill(row_bg)
-            if row_fg:
-                cell.font = _font(row_fg)
-            cell.border = _border
+def _col_structure(df_a: pd.DataFrame, df_b: pd.DataFrame) -> pd.DataFrame:
+    """
+    Restituisce un DataFrame che descrive la struttura delle colonne:
+    presenza in AS-IS / TO-BE, posizione, tipo inferito, coerenza.
+    """
+    ca, cb = list(df_a.columns), list(df_b.columns)
+    all_cols = sorted(set(ca) | set(cb),
+                      key=lambda x: (ca.index(x) if x in ca else 9999))
+    rows = []
+    for c in all_cols:
+        in_a, in_b = c in ca, c in cb
+        ta = _infer_type(df_a[c]) if in_a else "—"
+        tb = _infer_type(df_b[c]) if in_b else "—"
+        status = "OK" if (in_a and in_b) else ("SOLO AS-IS" if in_a else "SOLO TO-BE")
+        coerente = ("Si'" if (in_a and in_b and ta == tb)
+                    else ("—" if not (in_a and in_b) else "No"))
+        rows.append({
+            "COLONNA":        c,
+            "IN AS-IS":       "Si'" if in_a else "No",
+            "IN TO-BE":       "Si'" if in_b else "No",
+            "POS AS-IS":      ca.index(c) + 1 if in_a else "—",
+            "POS TO-BE":      cb.index(c) + 1 if in_b else "—",
+            "TIPO AS-IS":     ta,
+            "TIPO TO-BE":     tb,
+            "TIPO COERENTE":  coerente,
+            "STATUS":         status,
+        })
+    return pd.DataFrame(rows)
 
-    # Auto-width (max 60)
-    for ci in range(1, df.shape[1] + 1):
-        max_len = max(
-            len(str(ws.cell(row=r, column=ci).value or ""))
-            for r in range(1, min(ws.max_row + 1, 200))
-        )
-        ws.column_dimensions[get_column_letter(ci)].width = min(max_len + 2, 60)
 
+def _compare_rows_wide(
+    df_a: pd.DataFrame,
+    df_b: pd.DataFrame,
+    key_cols: list[str],
+    value_cols: list[str],
+    max_diff_rows: int,
+    max_only_rows: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int]:
+    """
+    Confronto righe, restituisce:
+      both_diff : DataFrame wide (key + col__AS + col__TO) delle sole righe con diff
+      only_as   : righe presenti solo in AS-IS
+      only_to   : righe presenti solo in TO-BE
+      n_diff_total : conteggio totale righe con differenze (non cappato)
+    """
+    common = key_cols + value_cols
+
+    df_a_c = df_a[common].fillna("").reset_index(drop=True)
+    df_b_c = df_b[common].fillna("").reset_index(drop=True)
+
+    if key_cols:
+        merged = pd.merge(df_a_c, df_b_c, on=key_cols,
+                          how="outer", suffixes=("__AS", "__TO"),
+                          indicator=True)
+        only_as = (merged[merged["_merge"] == "left_only"]
+                   .drop(columns=["_merge"])
+                   .rename(columns=lambda c: c.replace("__AS", "").replace("__TO", ""))
+                   .head(max_only_rows))
+        only_to = (merged[merged["_merge"] == "right_only"]
+                   .drop(columns=["_merge"])
+                   .rename(columns=lambda c: c.replace("__AS", "").replace("__TO", ""))
+                   .head(max_only_rows))
+        both = merged[merged["_merge"] == "both"].drop(columns=["_merge"]).reset_index(drop=True)
+    else:
+        n = min(len(df_a_c), len(df_b_c))
+        only_as = df_a_c.iloc[n:].head(max_only_rows).copy()
+        only_to = df_b_c.iloc[n:].head(max_only_rows).copy()
+        left  = df_a_c[value_cols].iloc[:n].reset_index(drop=True).add_suffix("__AS")
+        right = df_b_c[value_cols].iloc[:n].reset_index(drop=True).add_suffix("__TO")
+        both  = pd.concat([left, right], axis=1)
+
+    # Maschera righe con almeno una differenza
+    diff_mask = pd.Series(False, index=both.index)
+    for c in value_cols:
+        ca, cb = f"{c}__AS", f"{c}__TO"
+        if ca in both.columns and cb in both.columns:
+            diff_mask |= (both[ca].fillna("") != both[cb].fillna(""))
+
+    n_diff_total = int(diff_mask.sum())
+    both_diff = both[diff_mask].head(max_diff_rows).reset_index(drop=True)
+
+    return both_diff, only_as, only_to, n_diff_total
+
+
+def _sintesi_colonne(
+    both_diff_full: pd.DataFrame,   # df wide TUTTI i match (non solo quelli con diff)
+    key_cols: list[str],
+    value_cols: list[str],
+) -> pd.DataFrame:
+    rows = []
+    for c in value_cols:
+        ca, cb = f"{c}__AS", f"{c}__TO"
+        if ca not in both_diff_full.columns or cb not in both_diff_full.columns:
+            continue
+        eq   = int((both_diff_full[ca].fillna("") == both_diff_full[cb].fillna("")).sum())
+        diff = len(both_diff_full) - eq
+        tot  = len(both_diff_full)
+        rows.append({
+            "COLONNA":       c,
+            "CHIAVE":        "Si'" if c in key_cols else "No",
+            "RIGHE UGUALI":  eq,
+            "RIGHE DIVERSE": diff,
+            "TOT RIGHE":     tot,
+            "% DIVERSE":     f"{diff / tot * 100:.1f}%" if tot else "0%",
+            "STATO":         "OK" if diff == 0 else "DIFFERENZE",
+        })
+    return pd.DataFrame(rows)
+
+
+def _num_diff(a, b) -> str:
+    try:
+        return str(float(str(a).replace(",", ".")) - float(str(b).replace(",", ".")))
+    except (ValueError, TypeError):
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Scrittura Excel — 6 fogli
+# ---------------------------------------------------------------------------
 
 def build_excel_pair(
     label: str,
@@ -539,106 +700,204 @@ def build_excel_pair(
     output_path: str | Path,
     join_key: list[str] | None = None,
     max_diff_rows: int = 10_000,
+    max_only_rows: int = 5_000,
     log_path: str | Path | None = None,
 ) -> str:
     """
-    Confronta df_a e df_b e scrive un Excel con 5 fogli:
-    RIEPILOGO, SOLO_AS-IS, SOLO_TO-BE, DIFFERENZE_AS-IS, DIFFERENZE_TO-BE.
-    Restituisce il path dell'Excel generato.
+    Confronta df_a (AS-IS) e df_b (TO-BE) e scrive un Excel con 6 fogli:
+      RIEPILOGO    — riepilogo numerico coppia
+      STRUTTURA    — struttura colonne (presenza, posizione, tipo)
+      SINTESI_COL  — quante righe differiscono per colonna
+      DIFF         — vista wide chiave + AS-IS/TO-BE affiancati (celle diff in giallo)
+      SOLO_ASIS    — righe presenti solo in AS-IS
+      SOLO_TOBE    — righe presenti solo in TO-BE
     """
     output_path = Path(output_path)
-    result = compare_dataframes(df_a, df_b, join_key=join_key, max_diff_rows=max_diff_rows)
-    s = result["summary"]
 
+    # Normalizza entrambi per sicurezza
+    df_a = _clean_df(df_a)
+    df_b = _clean_df(df_b)
+
+    n_a, n_b = len(df_a), len(df_b)
+
+    # ── Struttura colonne ────────────────────────────────────────────────────
+    strut = _col_structure(df_a, df_b)
+    only_a_cols = strut[strut["STATUS"] == "SOLO AS-IS"]["COLONNA"].tolist()
+    only_b_cols = strut[strut["STATUS"] == "SOLO TO-BE"]["COLONNA"].tolist()
+
+    # ── Chiave di join ────────────────────────────────────────────────────────
+    if join_key is None:
+        join_key = detect_join_key(df_a, df_b)
+    key_cols = join_key or []
+    common   = [c for c in df_a.columns if c in df_b.columns]
+    value_cols = [c for c in common if c not in key_cols]
+
+    # ── Confronto righe ────────────────────────────────────────────────────────
+    both_diff, only_as, only_to, n_diff_total = _compare_rows_wide(
+        df_a, df_b, key_cols, value_cols, max_diff_rows, max_only_rows
+    )
+
+    # Per SINTESI_COL servono TUTTI i match (non solo quelli con diff)
+    if key_cols and not df_a.empty and not df_b.empty:
+        _common_c = key_cols + value_cols
+        _all_both = pd.merge(
+            df_a[_common_c].fillna(""), df_b[_common_c].fillna(""),
+            on=key_cols, how="inner", suffixes=("__AS", "__TO"),
+        )
+    else:
+        _all_both = both_diff   # fallback posizionale
+
+    sint = _sintesi_colonne(_all_both, key_cols, value_cols)
+    cols_w_diff = sint[sint["STATO"] == "DIFFERENZE"]["COLONNA"].tolist() if not sint.empty else []
+
+    ok_overall = (not only_a_cols and not only_b_cols
+                  and n_diff_total == 0 and n_a == n_b)
+
+    # ── Workbook ───────────────────────────────────────────────────────────────
     wb = openpyxl.Workbook()
+    wb.remove(wb.active)
 
-    # ---- Foglio RIEPILOGO ----
-    ws_sum = wb.active
-    ws_sum.title = "RIEPILOGO"
-    ws_sum.sheet_view.showGridLines = True
+    # ── 1. RIEPILOGO ──────────────────────────────────────────────────────────
+    ws_r = wb.create_sheet("RIEPILOGO")
+    _xl_title(ws_r, f"Riepilogo confronto AS-IS vs TO-BE  —  {label}", 11)
+    headers_r = ["FILE LOGICO", "FILE AS-IS", "FILE TO-BE",
+                 "RIGHE AS-IS", "RIGHE TO-BE", "DELTA RIGHE",
+                 "COL SOLO AS-IS", "COL SOLO TO-BE",
+                 "COLONNE CON DIFF", "RIGHE CON DIFF", "ESITO"]
+    ws_r.append(headers_r)
+    _xl_hdr_row(ws_r, 2)
 
-    def _hdr(ws, text):
-        ws.append([text])
-        cell = ws.cell(row=ws.max_row, column=1)
-        cell.fill = _fill(_CLR["header_bg"])
-        cell.font = _font(_CLR["header_fg"], bold=True)
-        cell.alignment = Alignment(horizontal="left")
+    ws_r.append([
+        label, asis_label, tobe_label,
+        n_a, n_b, n_a - n_b,
+        ", ".join(only_a_cols) or "—",
+        ", ".join(only_b_cols) or "—",
+        ", ".join(cols_w_diff) or "—",
+        n_diff_total,
+        "OK" if ok_overall else "DIFFERENZE",
+    ])
+    _xl_data_row(ws_r, 3, _C_OK if ok_overall else _C_KO)
+    ws_r.append([])
+    ws_r.append(["Chiave di join rilevata:",
+                 ", ".join(key_cols) if key_cols else "(confronto posizionale)"])
+    _xl_autofit(ws_r)
+    ws_r.freeze_panes = "A3"
 
-    def _row(ws, key, val, bg=None, fg=None):
-        ws.append([key, str(val)])
-        if bg:
-            for ci in (1, 2):
-                c = ws.cell(row=ws.max_row, column=ci)
-                c.fill = _fill(bg)
-                if fg: c.font = _font(fg)
+    # ── 2. STRUTTURA ─────────────────────────────────────────────────────────
+    ws_s = wb.create_sheet("STRUTTURA")
+    n_sc = len(strut.columns) if not strut.empty else 1
+    _xl_title(ws_s, f"Struttura colonne  —  {label}", n_sc)
+    if strut.empty:
+        ws_s.append(["(nessun dato)"])
+    else:
+        ws_s.append(list(strut.columns))
+        _xl_hdr_row(ws_s, 2)
+        for _, row in strut.iterrows():
+            ws_s.append(list(row))
+            rn = ws_s.max_row
+            st = str(row.get("STATUS", ""))
+            tc = str(row.get("TIPO COERENTE", "Si'"))
+            if   st == "SOLO AS-IS": _xl_data_row(ws_s, rn, _C_ONLY_AS)
+            elif st == "SOLO TO-BE": _xl_data_row(ws_s, rn, _C_ONLY_TO)
+            elif tc == "No":         _xl_data_row(ws_s, rn, _C_WARN)
+            else:                    _xl_data_row(ws_s, rn)
+    _xl_autofit(ws_s)
+    ws_s.freeze_panes = "A3"
 
-    _hdr(ws_sum, "RIEPILOGO CONFRONTO")
-    ws_sum.append([])
-    _row(ws_sum, "Coppia", label)
-    _row(ws_sum, "AS-IS", asis_label)
-    _row(ws_sum, "TO-BE", tobe_label)
-    _row(ws_sum, "Chiave join", ", ".join(result["key_used"]) if result["key_used"] else "(posizionale)")
-    ws_sum.append([])
-    _row(ws_sum, "Righe AS-IS", s["rows_a"])
-    _row(ws_sum, "Righe TO-BE", s["rows_b"])
-    ws_sum.append([])
-    struct_bg = _CLR["ok_bg"] if s["struct_ok"] else _CLR["diff_bg"]
-    struct_fg = _CLR["ok_fg"] if s["struct_ok"] else _CLR["diff_fg"]
-    _row(ws_sum, "Struttura colonne", "OK" if s["struct_ok"] else "DIVERSA", struct_bg, struct_fg)
-    _row(ws_sum, "Colonne solo AS-IS", s["cols_only_a"],
-         None if s["cols_only_a"] == 0 else _CLR["only_a_bg"],
-         None if s["cols_only_a"] == 0 else _CLR["only_a_fg"])
-    _row(ws_sum, "Colonne solo TO-BE", s["cols_only_b"],
-         None if s["cols_only_b"] == 0 else _CLR["only_b_bg"],
-         None if s["cols_only_b"] == 0 else _CLR["only_b_fg"])
-    _row(ws_sum, "Colonne comuni", s["cols_common"])
-    ws_sum.append([])
-    diff_bg = _CLR["ok_bg"] if s["rows_diff"] == 0 else _CLR["diff_bg"]
-    diff_fg = _CLR["ok_fg"] if s["rows_diff"] == 0 else _CLR["diff_fg"]
-    _row(ws_sum, "Righe con differenze", s["rows_diff"], diff_bg, diff_fg)
-    _row(ws_sum, "Righe solo AS-IS", s["rows_only_a"],
-         None if s["rows_only_a"] == 0 else _CLR["only_a_bg"],
-         None if s["rows_only_a"] == 0 else _CLR["only_a_fg"])
-    _row(ws_sum, "Righe solo TO-BE", s["rows_only_b"],
-         None if s["rows_only_b"] == 0 else _CLR["only_b_bg"],
-         None if s["rows_only_b"] == 0 else _CLR["only_b_fg"])
+    # ── 3. SINTESI_COL ────────────────────────────────────────────────────────
+    ws_sc = wb.create_sheet("SINTESI_COL")
+    n_sc2 = len(sint.columns) if not sint.empty else 1
+    _xl_title(ws_sc, f"Sintesi differenze per colonna  —  {label}", n_sc2)
+    if sint.empty:
+        ws_sc.append(["(nessun dato comparabile)"])
+    else:
+        ws_sc.append(list(sint.columns))
+        _xl_hdr_row(ws_sc, 2)
+        for _, row in sint.iterrows():
+            ws_sc.append(list(row))
+            rn = ws_sc.max_row
+            bg = _C_KO if str(row.get("STATO", "")) == "DIFFERENZE" else _C_OK
+            _xl_data_row(ws_sc, rn, bg)
+    _xl_autofit(ws_sc)
+    ws_sc.freeze_panes = "A3"
 
-    if result["cols_only_a"]:
-        ws_sum.append([])
-        _hdr(ws_sum, "Colonne SOLO AS-IS")
-        for c in result["cols_only_a"]:
-            ws_sum.append(["", c])
-    if result["cols_only_b"]:
-        ws_sum.append([])
-        _hdr(ws_sum, "Colonne SOLO TO-BE")
-        for c in result["cols_only_b"]:
-            ws_sum.append(["", c])
+    # ── 4. DIFF ────────────────────────────────────────────────────────────────
+    ws_d = wb.create_sheet("DIFF")
+    if both_diff.empty or not value_cols:
+        _xl_title(ws_d, f"Differenze riga x colonna  —  {label}", 1)
+        ws_d.append(["(nessuna differenza rilevata)"])
+    else:
+        truncated = n_diff_total > max_diff_rows
+        note = (f" — prime {max_diff_rows:,} su {n_diff_total:,} righe con diff"
+                if truncated else f" — {len(both_diff):,} righe con diff")
+        # Costruisci intestazione wide: chiave | col [AS-IS] | col [TO-BE] | DIFF col | ...
+        headers_d = list(key_cols)
+        for c in value_cols:
+            headers_d += [f"{c} [AS-IS]", f"{c} [TO-BE]", f"DIFF {c}"]
 
-    ws_sum.column_dimensions["A"].width = 28
-    ws_sum.column_dimensions["B"].width = 60
+        _xl_title(ws_d, f"Differenze riga x colonna  —  {label}{note}", len(headers_d))
+        ws_d.append(headers_d)
+        _xl_hdr_row(ws_d, 2)
+        # Intestazioni chiave con colore distinto
+        for i, _ in enumerate(key_cols, 1):
+            ws_d.cell(row=2, column=i).fill = _xl_fill(_C_KEY_HDR)
 
-    # ---- Foglio SOLO_AS-IS ----
-    ws_oa = wb.create_sheet("SOLO_AS-IS")
-    _write_df_to_sheet(ws_oa, result["df_only_a"], "SOLO_AS-IS",
-                       _CLR["header_bg"], _CLR["header_fg"],
-                       _CLR["only_a_bg"], _CLR["only_a_fg"])
+        for _, row in both_diff.iterrows():
+            row_vals = [row.get(k, "") for k in key_cols]
+            for c in value_cols:
+                va = row.get(f"{c}__AS", "")
+                vb = row.get(f"{c}__TO", "")
+                row_vals += [va, vb, _num_diff(va, vb)]
+            ws_d.append(row_vals)
+            rn = ws_d.max_row
+            _xl_data_row(ws_d, rn)
+            # Evidenzia in giallo le celle AS-IS e TO-BE dove c'e' differenza
+            col_offset = len(key_cols) + 1
+            for c in value_cols:
+                va = str(row.get(f"{c}__AS", "")).strip()
+                vb = str(row.get(f"{c}__TO", "")).strip()
+                if va != vb:
+                    ws_d.cell(rn, col_offset).fill     = _xl_fill(_C_DIFF)
+                    ws_d.cell(rn, col_offset + 1).fill = _xl_fill(_C_DIFF)
+                col_offset += 3
 
-    # ---- Foglio SOLO_TO-BE ----
-    ws_ob = wb.create_sheet("SOLO_TO-BE")
-    _write_df_to_sheet(ws_ob, result["df_only_b"], "SOLO_TO-BE",
-                       _CLR["header_bg"], _CLR["header_fg"],
-                       _CLR["only_b_bg"], _CLR["only_b_fg"])
+        _xl_autofit(ws_d)
+        if key_cols:
+            ws_d.freeze_panes = f"{get_column_letter(len(key_cols) + 1)}3"
 
-    # ---- Fogli DIFFERENZE ----
-    ws_da = wb.create_sheet("DIFF_AS-IS")
-    _write_df_to_sheet(ws_da, result["df_diff_a"], "DIFF_AS-IS",
-                       _CLR["header_bg"], _CLR["header_fg"],
-                       _CLR["diff_bg"], _CLR["diff_fg"])
+    # ── 5. SOLO_ASIS ──────────────────────────────────────────────────────────
+    ws_a = wb.create_sheet("SOLO_ASIS")
+    nc_a = max(len(only_as.columns), 1) if not only_as.empty else 1
+    trunc_a = len(only_as) >= max_only_rows
+    title_a = (f"Solo in AS-IS  —  {label}"
+               + (f"  (prime {max_only_rows:,} righe)" if trunc_a else ""))
+    _xl_title(ws_a, title_a, nc_a)
+    if only_as.empty:
+        ws_a.append(["(nessuna riga esclusiva in AS-IS)"])
+    else:
+        ws_a.append(list(only_as.columns))
+        _xl_hdr_row(ws_a, 2)
+        for _, row in only_as.iterrows():
+            ws_a.append(list(row))
+            _xl_data_row(ws_a, ws_a.max_row, _C_ONLY_AS)
+    _xl_autofit(ws_a)
 
-    ws_db = wb.create_sheet("DIFF_TO-BE")
-    _write_df_to_sheet(ws_db, result["df_diff_b"], "DIFF_TO-BE",
-                       _CLR["header_bg"], _CLR["header_fg"],
-                       _CLR["diff_bg"], _CLR["diff_fg"])
+    # ── 6. SOLO_TOBE ──────────────────────────────────────────────────────────
+    ws_t = wb.create_sheet("SOLO_TOBE")
+    nc_t = max(len(only_to.columns), 1) if not only_to.empty else 1
+    trunc_t = len(only_to) >= max_only_rows
+    title_t = (f"Solo in TO-BE  —  {label}"
+               + (f"  (prime {max_only_rows:,} righe)" if trunc_t else ""))
+    _xl_title(ws_t, title_t, nc_t)
+    if only_to.empty:
+        ws_t.append(["(nessuna riga esclusiva in TO-BE)"])
+    else:
+        ws_t.append(list(only_to.columns))
+        _xl_hdr_row(ws_t, 2)
+        for _, row in only_to.iterrows():
+            ws_t.append(list(row))
+            _xl_data_row(ws_t, ws_t.max_row, _C_ONLY_TO)
+    _xl_autofit(ws_t)
 
     wb.save(output_path)
     return str(output_path)
