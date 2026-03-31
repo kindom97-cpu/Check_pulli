@@ -564,7 +564,10 @@ def _infer_type(series: pd.Series) -> str:
     if num_frac > 0.9:
         return "DECIMALE" if s.str.contains(r"\.", na=False).any() else "INTERO"
     try:
-        pd.to_datetime(s, dayfirst=True, errors="raise")
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pd.to_datetime(s, dayfirst=True, errors="raise")
         return "DATA"
     except Exception:
         pass
