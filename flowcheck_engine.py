@@ -205,25 +205,30 @@ def _has_header_from_text(text: str, sep: str) -> bool:
 
 def _stem_key(name: str) -> str:
     """
-    Chiave di matching normalizzata: rimuove timestamp e estensione,
-    porta tutto in uppercase, rimuove trattini/punti ridondanti.
-    Esempio: DW.D.PLZHA.AVTBCODI.20260326000000.000L.20260326030157.csv
-             => AVTBCODI
+    Chiave di matching normalizzata: rimuove timestamp, estensione e
+    prefissi tecnici noti (DW, D, M, PLZxx), conservando il nome tabella
+    anche quando composto da piu' parti (es. ABK001FW_DANNI, ABBINAMENTO_PLZ_DANNI).
+
+    Esempi:
+      DW.D.PLZHA.AVTBCODI.20260326000000.000L.20260326030157.csv  => AVTBCODI
+      DW.D.PLZ3A.ABBINAMENTO_PLZ_DANNI.20260326000000.000L.csv    => ABBINAMENTO_PLZ_DANNI
+      DW.D.PLZAA.ABK001FW_DANNI.csv                               => ABK001FW_DANNI
+      DW.D.PLZBA.STORNI_DANNI.csv                                 => STORNI_DANNI
     """
     name = Path(name).stem.upper()
-    # rimuovi blocchi timestamp (es. 20260326000000, 20260326030157, 000L)
+    # Rimuovi blocchi timestamp (es. 20260326000000) e suffissi tipo 000L
     name = re.sub(r"\b\d{14}\b", "", name)
     name = re.sub(r"\b\d{3}L\b", "", name)
-    name = re.sub(r"[.\-_]+", "_", name)
+    # Normalizza separatori in underscore, pulisci underscore multipli
+    name = re.sub(r"[.\-]+", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_")
+    # Rimuovi prefissi tecnici noti (DW_D_PLZxx_, DW_M_PLZxx_, D_PLZxx_, ecc.)
+    # PLZxx = PLZ seguito da esattamente 2 caratteri alfanumerici (es. 3A, HA, AA ...)
+    name = re.sub(r"^(DW_)?[DM]_PLZ\w{2}_", "", name)
+    # Rimuovi eventuali residui DW_D_ / DW_M_ / D_ / M_ rimasti
+    name = re.sub(r"^(DW_)?[DM]_", "", name)
     name = name.strip("_")
-    # prendi l'ultimo token significativo (dopo DW_D_PLZHA_ ecc.)
-    # strategia: prendi il token piu' lungo tra quelli rimasti
-    tokens = [t for t in name.split("_") if len(t) > 2]
-    if tokens:
-        # il "nome tabella" tende ad essere dopo prefissi noti tipo DW, D, M, PLZHA ecc.
-        # usa l'ultimo token come chiave
-        return tokens[-1]
-    return name
+    return name if name else Path(name).stem.upper()
 
 
 def match_files(
