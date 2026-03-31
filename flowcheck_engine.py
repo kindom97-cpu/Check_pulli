@@ -904,7 +904,263 @@ def build_excel_pair(
 
 
 # ---------------------------------------------------------------------------
-# Log errori
+# Issue log — raccolta dati e generazione Excel riepilogo anomalie
+# ---------------------------------------------------------------------------
+
+def _detect_whitespace_in_raw(filepath: str | Path,
+                               zip_entry: str | None,
+                               sep: str,
+                               n_lines: int = 100) -> int:
+    """
+    Legge le prime n_lines righe raw (senza pulizia) e conta i campi
+    che hanno spazi leading/trailing o caratteri non-breaking (\xa0).
+    """
+    fp = Path(filepath)
+    lines = _read_first_lines(fp, n=n_lines + 1, zip_entry=zip_entry)
+    if len(lines) > 1:
+        lines = lines[1:]          # salta intestazione
+    count = 0
+    for line in lines:
+        for field in line.rstrip("\n\r").split(sep):
+            raw = field.strip('"').strip("'")
+            if raw != raw.strip() or "\xa0" in raw:
+                count += 1
+    return count
+
+
+def _collect_pair_issues(
+    label: str,
+    asis_label: str,
+    tobe_label: str,
+    df_a: pd.DataFrame,
+    df_b: pd.DataFrame,
+    sep_a: str,
+    sep_b: str,
+    n_ws_a: int,
+    n_ws_b: int,
+) -> dict:
+    """Raccoglie tutte le anomalie di una coppia AS-IS / TO-BE."""
+    strut = _col_structure(df_a, df_b)
+    only_a_cols = strut[strut["STATUS"] == "SOLO AS-IS"]["COLONNA"].tolist()
+    only_b_cols = strut[strut["STATUS"] == "SOLO TO-BE"]["COLONNA"].tolist()
+    type_mm = (strut[(strut["STATUS"] == "OK") & (strut["TIPO COERENTE"] == "No")]
+               [["COLONNA", "TIPO AS-IS", "TIPO TO-BE"]]
+               .to_dict("records"))
+
+    key_cols   = detect_join_key(df_a, df_b)
+    common     = [c for c in df_a.columns if c in df_b.columns]
+    value_cols = [c for c in common if c not in key_cols]
+
+    # Conta solo (max 1 riga, vogliamo solo i contatori)
+    _, only_as_df, only_to_df, n_diff = _compare_rows_wide(
+        df_a, df_b, key_cols, value_cols,
+        max_diff_rows=1, max_only_rows=5_000,
+    )
+
+    return {
+        "label":           label,
+        "asis_label":      asis_label,
+        "tobe_label":      tobe_label,
+        "sep_asis":        sep_a,
+        "sep_tobe":        sep_b,
+        "sep_ok":          sep_a == sep_b,
+        "n_a":             len(df_a),
+        "n_b":             len(df_b),
+        "cols_only_a":     only_a_cols,
+        "cols_only_b":     only_b_cols,
+        "type_mismatches": type_mm,
+        "n_diff_rows":     n_diff,
+        "n_only_a":        len(only_as_df),
+        "n_only_b":        len(only_to_df),
+        "n_ws_a":          n_ws_a,   # campi con spazi in AS-IS
+        "n_ws_b":          n_ws_b,   # campi con spazi in TO-BE
+        "error":           None,
+    }
+
+
+def build_issue_log(issue_records: list[dict], output_path: str | Path) -> str:
+    """
+    Genera un Excel riepilogo anomalie — da allegare alle mail.
+
+    Fogli:
+      RIEPILOGO          — una riga per coppia con tutti i contatori
+      SEPARATORI         — solo coppie con separatore AS-IS != TO-BE
+      ANOMALIE_STRUTTURA — colonne mancanti o in piu' rispetto all'altra versione
+      CONFORMITA_TIPI    — colonne con tipo inferito diverso tra AS-IS e TO-BE
+    """
+    output_path = Path(output_path)
+    ts_label = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    # helper: riga con sfondo condizionale
+    def _row_colored(ws, values: list, bg: str | None):
+        ws.append(values)
+        _xl_data_row(ws, ws.max_row, bg)
+
+    # ── 1. RIEPILOGO ──────────────────────────────────────────────────────────
+    ws_r = wb.create_sheet("RIEPILOGO")
+    n_pairs = len(issue_records)
+    _xl_title(ws_r, f"Issue Log — Confronto AS-IS vs TO-BE  ({ts_label})", 14)
+    hdr = ["FILE LOGICO", "FILE AS-IS", "FILE TO-BE",
+           "SEP AS-IS", "SEP TO-BE", "SEP DIVERSO?",
+           "RIGHE AS-IS", "RIGHE TO-BE", "DELTA RIGHE",
+           "COL MANCANTI", "RIGHE CON DIFF",
+           "RIGHE SOLO AS-IS", "RIGHE SOLO TO-BE",
+           "ESITO"]
+    ws_r.append(hdr)
+    _xl_hdr_row(ws_r, 2)
+
+    for rec in issue_records:
+        if rec.get("error"):
+            _row_colored(ws_r, [
+                rec["label"], rec.get("asis_label",""), rec.get("tobe_label",""),
+                "—","—","—","—","—","—","—","—","—","—",
+                f"ERRORE: {rec['error']}",
+            ], _C_WARN)
+            continue
+
+        n_col_miss = len(rec["cols_only_a"]) + len(rec["cols_only_b"])
+        sep_div    = "SI'" if not rec["sep_ok"] else "No"
+        delta      = rec["n_a"] - rec["n_b"]
+        has_issue  = (not rec["sep_ok"] or n_col_miss > 0
+                      or rec["n_diff_rows"] > 0
+                      or rec["n_only_a"] > 0 or rec["n_only_b"] > 0)
+        esito      = "OK" if not has_issue else "ANOMALIE"
+
+        _row_colored(ws_r, [
+            rec["label"], rec["asis_label"], rec["tobe_label"],
+            rec["sep_asis"], rec["sep_tobe"], sep_div,
+            rec["n_a"], rec["n_b"], delta,
+            n_col_miss,
+            rec["n_diff_rows"],
+            rec["n_only_a"], rec["n_only_b"],
+            esito,
+        ], _C_OK if esito == "OK" else _C_KO)
+
+    # Riga totali
+    ws_r.append([])
+    ws_r.append(["Totale coppie analizzate:", n_pairs])
+    ws_r.append(["Coppie con anomalie:",
+                 sum(1 for r in issue_records
+                     if not r.get("error") and (
+                         not r["sep_ok"]
+                         or len(r["cols_only_a"]) + len(r["cols_only_b"]) > 0
+                         or r["n_diff_rows"] > 0
+                         or r["n_only_a"] > 0 or r["n_only_b"] > 0
+                     ))])
+    _xl_autofit(ws_r)
+    ws_r.freeze_panes = "A3"
+
+    # ── 2. SEPARATORI ─────────────────────────────────────────────────────────
+    ws_sep = wb.create_sheet("SEPARATORI")
+    _xl_title(ws_sep, "File con separatore CSV diverso tra AS-IS e TO-BE", 6)
+    ws_sep.append(["FILE LOGICO", "FILE AS-IS", "FILE TO-BE",
+                   "SEP AS-IS", "SEP TO-BE", "NOTA"])
+    _xl_hdr_row(ws_sep, 2)
+
+    sep_anomalies = [r for r in issue_records if not r.get("error") and not r["sep_ok"]]
+    if sep_anomalies:
+        for rec in sep_anomalies:
+            nota = (f"AS-IS usa '{rec['sep_asis']}', "
+                    f"TO-BE usa '{rec['sep_tobe']}'. "
+                    "Il separatore viene rilevato automaticamente per ogni file.")
+            _row_colored(ws_sep, [
+                rec["label"], rec["asis_label"], rec["tobe_label"],
+                rec["sep_asis"], rec["sep_tobe"], nota,
+            ], _C_WARN)
+    else:
+        ws_sep.append(["(nessuna coppia con separatori diversi)"])
+    _xl_autofit(ws_sep)
+
+    # ── 3. ANOMALIE_STRUTTURA ─────────────────────────────────────────────────
+    ws_str = wb.create_sheet("ANOMALIE_STRUTTURA")
+    _xl_title(ws_str, "Colonne presenti in un solo file della coppia", 4)
+    ws_str.append(["FILE LOGICO", "COLONNA", "ANOMALIA", "NOTA"])
+    _xl_hdr_row(ws_str, 2)
+
+    has_struct = False
+    for rec in issue_records:
+        if rec.get("error"):
+            continue
+        for c in rec["cols_only_a"]:
+            _row_colored(ws_str, [
+                rec["label"], c, "SOLO AS-IS",
+                "Colonna presente in AS-IS ma assente in TO-BE",
+            ], _C_ONLY_AS)
+            has_struct = True
+        for c in rec["cols_only_b"]:
+            _row_colored(ws_str, [
+                rec["label"], c, "SOLO TO-BE",
+                "Colonna presente in TO-BE ma assente in AS-IS",
+            ], _C_ONLY_TO)
+            has_struct = True
+
+    if not has_struct:
+        ws_str.append(["(nessuna anomalia strutturale rilevata)"])
+    _xl_autofit(ws_str)
+
+    # ── 4. CONFORMITA_TIPI ────────────────────────────────────────────────────
+    ws_ti = wb.create_sheet("CONFORMITA_TIPI")
+    _xl_title(ws_ti, "Colonne con tipo di dato incoerente tra AS-IS e TO-BE", 5)
+    ws_ti.append(["FILE LOGICO", "COLONNA", "TIPO AS-IS", "TIPO TO-BE", "NOTA"])
+    _xl_hdr_row(ws_ti, 2)
+
+    has_type = False
+    for rec in issue_records:
+        if rec.get("error"):
+            continue
+        for mm in rec["type_mismatches"]:
+            _row_colored(ws_ti, [
+                rec["label"],
+                mm["COLONNA"],
+                mm["TIPO AS-IS"],
+                mm["TIPO TO-BE"],
+                f"Atteso tipo coerente: AS-IS={mm['TIPO AS-IS']}, "
+                f"TO-BE={mm['TIPO TO-BE']}",
+            ], _C_WARN)
+            has_type = True
+
+    if not has_type:
+        ws_ti.append(["(nessuna difformita' di tipo rilevata)"])
+    _xl_autofit(ws_ti)
+
+    # ── 5. SPAZI ──────────────────────────────────────────────────────────────
+    ws_sp = wb.create_sheet("SPAZI")
+    _xl_title(ws_sp, "File con campi contenenti spazi da normalizzare", 4)
+    ws_sp.append(["FILE LOGICO", "VERSIONE", "FILE", "CAMPI CON SPAZI RILEVATI"])
+    _xl_hdr_row(ws_sp, 2)
+
+    has_ws = False
+    for rec in issue_records:
+        if rec.get("error"):
+            continue
+        if rec.get("n_ws_a", 0) > 0:
+            _row_colored(ws_sp, [
+                rec["label"], "AS-IS", rec["asis_label"], rec["n_ws_a"],
+            ], _C_WARN)
+            has_ws = True
+        if rec.get("n_ws_b", 0) > 0:
+            _row_colored(ws_sp, [
+                rec["label"], "TO-BE", rec["tobe_label"], rec["n_ws_b"],
+            ], _C_WARN)
+            has_ws = True
+
+    if not has_ws:
+        ws_sp.append(["(nessun campo con spazi rilevato)"])
+
+    ws_sp.append([])
+    ws_sp.append(["Nota:", "Gli spazi vengono rimossi automaticamente prima del confronto. "
+                  "I valori nel report riflettono il dato dopo normalizzazione."])
+    _xl_autofit(ws_sp)
+
+    wb.save(output_path)
+    return str(output_path)
+
+
+# ---------------------------------------------------------------------------
+# Log errori tecnici
 # ---------------------------------------------------------------------------
 
 def log_error(log_path: str | Path, label: str, exc: Exception) -> None:
@@ -1007,7 +1263,8 @@ def run_comparison(
     _log(f"Coppie abbinate: {sum(1 for p in pairs if p['tobe_path'])}/{len(pairs)}")
     _log("")
 
-    generated = []
+    generated    = []
+    issue_records: list[dict] = []
 
     for pair in pairs:
         label = pair["label"]
@@ -1018,23 +1275,31 @@ def run_comparison(
         _log(f"  Confronto: {label} ...")
 
         try:
-            # Carica AS-IS
+            # ── Rileva separatori (per issue log) ──────────────────────────
             a_path_str = pair["asis_path"]
-            if "::" in a_path_str:
-                zp, ze = a_path_str.split("::", 1)
-                df_a = read_csv_from_zip(zp, ze, sep=sep)
-            else:
-                df_a = read_csv(a_path_str, sep=sep)
-
-            # Carica TO-BE
             b_path_str = pair["tobe_path"]
-            if "::" in b_path_str:
-                zp, ze = b_path_str.split("::", 1)
-                df_b = read_csv_from_zip(zp, ze, sep=sep)
-            else:
-                df_b = read_csv(b_path_str, sep=sep)
 
-            # Genera Excel
+            if "::" in a_path_str:
+                zp_a, ze_a = a_path_str.split("::", 1)
+                sep_a = sep if sep else detect_separator(zp_a, zip_entry=ze_a)
+                df_a  = read_csv_from_zip(zp_a, ze_a, sep=sep)
+                n_ws_a = _detect_whitespace_in_raw(zp_a, ze_a, sep_a)
+            else:
+                sep_a = sep if sep else detect_separator(a_path_str)
+                df_a  = read_csv(a_path_str, sep=sep)
+                n_ws_a = _detect_whitespace_in_raw(a_path_str, None, sep_a)
+
+            if "::" in b_path_str:
+                zp_b, ze_b = b_path_str.split("::", 1)
+                sep_b = sep if sep else detect_separator(zp_b, zip_entry=ze_b)
+                df_b  = read_csv_from_zip(zp_b, ze_b, sep=sep)
+                n_ws_b = _detect_whitespace_in_raw(zp_b, ze_b, sep_b)
+            else:
+                sep_b = sep if sep else detect_separator(b_path_str)
+                df_b  = read_csv(b_path_str, sep=sep)
+                n_ws_b = _detect_whitespace_in_raw(b_path_str, None, sep_b)
+
+            # ── Genera Excel per coppia ────────────────────────────────────
             out_name = f"confronto_{label}_{ts}.xlsx"
             out_path = output_dir / out_name
 
@@ -1050,16 +1315,43 @@ def run_comparison(
                 log_path=log_path,
             )
             generated.append(generated_path)
+
+            # ── Raccoglie dati per issue log ───────────────────────────────
+            issue_records.append(_collect_pair_issues(
+                label=label,
+                asis_label=pair["asis_label"],
+                tobe_label=pair["tobe_label"],
+                df_a=df_a, df_b=df_b,
+                sep_a=sep_a, sep_b=sep_b,
+                n_ws_a=n_ws_a, n_ws_b=n_ws_b,
+            ))
+
             _log(f"  [OK] Excel salvato: {out_name}")
 
         except Exception as exc:
             log_error(log_path, label, exc)
             _log(f"  [ERRORE] {label} - vedi log: {log_path.name}")
+            issue_records.append({
+                "label": label,
+                "asis_label": pair.get("asis_label", ""),
+                "tobe_label": pair.get("tobe_label", ""),
+                "error": str(exc),
+            })
+
+    # ── Genera issue log Excel ─────────────────────────────────────────────
+    if issue_records:
+        issue_log_path = output_dir / f"issue_log_{ts}.xlsx"
+        try:
+            build_issue_log(issue_records, issue_log_path)
+            _log(f"Issue log: {issue_log_path.name}")
+        except Exception as exc:
+            log_error(log_path, "build_issue_log", exc)
+            _log(f"  [ATTENZIONE] Issue log non generato: {exc}")
 
     _log("")
     _log(f"Completato. {len(generated)}/{len([p for p in pairs if p['tobe_path']])} Excel generati.")
     if log_path.exists():
-        _log(f"Log errori: {log_path.name}")
+        _log(f"Log errori tecnici: {log_path.name}")
     return generated
 
 
