@@ -48,20 +48,87 @@ _border = Border(
 # Rilevamento separatore
 # ---------------------------------------------------------------------------
 
-def detect_separator(filepath: str | Path, candidates: list[str] | None = None) -> str:
+def _read_first_lines(filepath: Path, n: int = 30,
+                      zip_entry: str | None = None) -> list[str]:
     """
-    Legge le prime 30 righe del file (gestendo zip inline),
-    conta le occorrenze di ogni separatore candidato e restituisce
-    quello con la distribuzione piu' stabile (massimo: avg / (1 + var)).
+    Legge le prime n righe da:
+    - file CSV normale
+    - CSV specifico dentro uno ZIP (zip_entry = nome file interno)
+    - primo CSV trovato in uno ZIP (zip_entry=None)
     """
-    cands = candidates if candidates else SEP_CANDIDATES
-    filepath = Path(filepath)
+    try:
+        if filepath.suffix.lower() == ".zip":
+            with zipfile.ZipFile(filepath) as zf:
+                target = zip_entry
+                if target is None:
+                    csv_names = [x for x in zf.namelist()
+                                 if x.lower().endswith(".csv") and not x.startswith("__")]
+                    target = csv_names[0] if csv_names else None
+                if target:
+                    with zf.open(target) as fh:
+                        raw = fh.read(16384).decode("utf-8", errors="replace")
+                        return raw.splitlines()[:n]
+        else:
+            with open(filepath, encoding="utf-8", errors="replace") as fh:
+                return [fh.readline() for _ in range(n)]
+    except Exception:
+        pass
+    return []
 
-    lines = _read_first_lines(filepath, n=30)
+
+def _build_sep_candidates(lines: list[str]) -> list[str]:
+    """
+    Costruisce la lista di separatori candidati unendo quelli statici con
+    eventuali separatori compositi ;X rilevati dinamicamente nelle righe.
+    Questo permette di gestire qualsiasi variante (;#, ;£, ;|, ;@, ...) senza
+    dover aggiornare la lista fissa.
+    """
+    import collections
+
+    cands = list(SEP_CANDIDATES)
+
+    # Cerca il carattere X che segue ';' in modo costante su tutte le righe
+    after_semi: collections.Counter = collections.Counter()
+    non_empty_lines = [l for l in lines if l.strip()]
+    for line in non_empty_lines:
+        for i in range(len(line) - 1):
+            if line[i] == ";":
+                nxt = line[i + 1]
+                # ignora spazi, virgolette, newline, alfanumerici, altro ;
+                if not nxt.isalnum() and nxt not in (";", " ", "\n", "\r", '"', "'"):
+                    after_semi[nxt] += 1
+
+    if after_semi:
+        best_char, count = after_semi.most_common(1)[0]
+        # accettiamo il candidato se appare in almeno il 50% delle righe non vuote
+        threshold = max(1, len(non_empty_lines) * 0.5)
+        if count >= threshold:
+            compound = f";{best_char}"
+            if compound not in cands:
+                cands.insert(0, compound)   # massima priorita'
+
+    return cands
+
+
+def detect_separator(filepath: str | Path,
+                     candidates: list[str] | None = None,
+                     zip_entry: str | None = None) -> str:
+    """
+    Rileva il separatore CSV piu' probabile usando un punteggio
+    avg_occorrenze / (1 + varianza) su max 30 righe.
+
+    filepath  : percorso al file CSV o ZIP
+    candidates: lista separatori da testare; None = auto (statici + dinamici)
+    zip_entry : nome del file CSV dentro lo ZIP (None = primo trovato)
+    """
+    import statistics
+
+    filepath = Path(filepath)
+    lines = _read_first_lines(filepath, n=30, zip_entry=zip_entry)
     if not lines:
         return ";"
 
-    import statistics
+    cands = list(candidates) if candidates else _build_sep_candidates(lines)
 
     best_sep, best_score = ";", -1.0
     for sep in cands:
@@ -74,25 +141,6 @@ def detect_separator(filepath: str | Path, candidates: list[str] | None = None) 
         if score > best_score:
             best_score, best_sep = score, sep
     return best_sep
-
-
-def _read_first_lines(filepath: Path, n: int = 30) -> list[str]:
-    """Legge le prime n righe da file normale, CSV dentro ZIP, o cartella-ZIP."""
-    try:
-        if filepath.suffix.lower() == ".zip":
-            with zipfile.ZipFile(filepath) as zf:
-                csv_names = [x for x in zf.namelist()
-                             if x.lower().endswith(".csv") and not x.startswith("__")]
-                if csv_names:
-                    with zf.open(csv_names[0]) as fh:
-                        raw = fh.read(8192).decode("utf-8", errors="replace")
-                        return raw.splitlines()[:n]
-        else:
-            with open(filepath, encoding="utf-8", errors="replace") as fh:
-                return [fh.readline() for _ in range(n) if True]  # semplice
-    except Exception:
-        pass
-    return []
 
 
 # ---------------------------------------------------------------------------
@@ -174,17 +222,34 @@ def read_csv(filepath: str | Path, sep: str | None = None) -> pd.DataFrame:
         engine=engine,
     )
     df.columns = _dedup_columns([str(c).strip() for c in df.columns])
-    # Rimuovi SOLO colonne con nome vuoto (artefatti di trailing sep)
-    df = df[[c for c in df.columns if c != ""]]
+    # Rimuovi colonne-artefatto: nome vuoto o solo caratteri speciali (es. '#', '£')
+    df = df[[c for c in df.columns if not _is_artifact_col(c)]]
     df = _clean_df(df)
     return df
+
+
+def _is_artifact_col(col_name: str) -> bool:
+    """
+    True se il nome colonna e' un artefatto del separatore CSV e va scartato:
+    - stringa vuota  (es. trailing ';' -> '')
+    - solo caratteri speciali non-word  (es. '#', '£', '|', ';#', ';£')
+    I nomi legittimi contengono almeno una lettera, cifra o underscore.
+    """
+    stripped = col_name.strip()
+    if not stripped:
+        return True
+    # nessun carattere \w (lettera, cifra, _) -> artefatto
+    if not re.search(r"\w", stripped):
+        return True
+    return False
 
 
 def read_csv_from_zip(zip_path: str | Path, csv_name: str, sep: str | None = None) -> pd.DataFrame:
     """Estrae un CSV da uno ZIP in memoria e lo legge."""
     zip_path = Path(zip_path)
     if sep is None:
-        sep = detect_separator(zip_path)
+        # Rileva il separatore dal CSV specifico, non dal primo dello ZIP
+        sep = detect_separator(zip_path, zip_entry=csv_name)
     engine = "python" if len(sep) > 1 else "c"
     sep_param = re.escape(sep) if engine == "python" else sep
 
@@ -205,7 +270,8 @@ def read_csv_from_zip(zip_path: str | Path, csv_name: str, sep: str | None = Non
         engine=engine,
     )
     df.columns = _dedup_columns([str(c).strip() for c in df.columns])
-    df = df[[c for c in df.columns if c != ""]]
+    # Rimuovi colonne-artefatto: nome vuoto o solo caratteri speciali (es. '#', '£')
+    df = df[[c for c in df.columns if not _is_artifact_col(c)]]
     df = _clean_df(df)
     return df
 
