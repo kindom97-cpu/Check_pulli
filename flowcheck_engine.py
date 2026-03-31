@@ -913,6 +913,49 @@ def build_excel_pair(
 
 
 # ---------------------------------------------------------------------------
+# Rilevamento righe malformate (saltate da on_bad_lines='skip')
+# ---------------------------------------------------------------------------
+
+def _get_raw_content(path_str: str, zip_entry: str | None = None) -> str:
+    """Legge il contenuto grezzo da file CSV o da una entry ZIP."""
+    if zip_entry:
+        with zipfile.ZipFile(path_str) as zf:
+            with zf.open(zip_entry) as fh:
+                return fh.read().decode("utf-8", errors="replace")
+    else:
+        with open(path_str, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+
+
+def _find_bad_lines(raw: str, sep: str) -> list[tuple[int, str]]:
+    """
+    Scorre le righe raw (saltando l'header) e restituisce
+    [(numero_riga_1based, contenuto)] per le righe che pandas ha saltato.
+
+    Logica:
+    - n_expected = campi nell'header (es. 34 con trailing sep)
+    - righe con n_expected-1 campi sono NORMALI (il trailing sep e' assente
+      nelle righe dati ma presente nell'header) -> non flaggate
+    - righe con piu' di n_expected campi -> campo contiene il separatore
+      senza virgolette -> queste vengono saltate da pandas -> flaggate
+    - righe con meno di n_expected-1 campi -> riga troncata -> flaggate
+    """
+    lines = raw.splitlines()
+    if len(lines) < 2:
+        return []
+    n_expected = len(lines[0].rstrip("\r\n").split(sep))
+    bad: list[tuple[int, str]] = []
+    for i, line in enumerate(lines[1:], start=2):
+        if not line.strip():
+            continue
+        n_fields = len(line.rstrip("\r\n").split(sep))
+        # Consenti n_expected-1 (trailing sep solo nell'header e' normale)
+        if n_fields > n_expected or n_fields < n_expected - 1:
+            bad.append((i, line.rstrip("\r\n")))
+    return bad
+
+
+# ---------------------------------------------------------------------------
 # Issue log — raccolta dati e generazione Excel riepilogo anomalie
 # ---------------------------------------------------------------------------
 
@@ -947,6 +990,8 @@ def _collect_pair_issues(
     sep_b: str,
     n_ws_a: int,
     n_ws_b: int,
+    bad_lines_a: list[tuple[int, str]] | None = None,
+    bad_lines_b: list[tuple[int, str]] | None = None,
 ) -> dict:
     """Raccoglie tutte le anomalie di una coppia AS-IS / TO-BE."""
     strut = _col_structure(df_a, df_b)
@@ -981,8 +1026,10 @@ def _collect_pair_issues(
         "n_diff_rows":     n_diff,
         "n_only_a":        len(only_as_df),
         "n_only_b":        len(only_to_df),
-        "n_ws_a":          n_ws_a,   # campi con spazi in AS-IS
-        "n_ws_b":          n_ws_b,   # campi con spazi in TO-BE
+        "n_ws_a":          n_ws_a,
+        "n_ws_b":          n_ws_b,
+        "bad_lines_a":     bad_lines_a or [],
+        "bad_lines_b":     bad_lines_b or [],
         "error":           None,
     }
 
@@ -1164,6 +1211,41 @@ def build_issue_log(issue_records: list[dict], output_path: str | Path) -> str:
                   "I valori nel report riflettono il dato dopo normalizzazione."])
     _xl_autofit(ws_sp)
 
+    # ── 6. RIGHE_SALTATE ──────────────────────────────────────────────────────
+    ws_sk = wb.create_sheet("RIGHE_SALTATE")
+    _xl_title(ws_sk, "Righe saltate in lettura (numero campi diverso dall'header)", 5)
+    ws_sk.append(["FILE LOGICO", "VERSIONE", "FILE", "N. RIGA (orig.)", "CONTENUTO RIGA"])
+    _xl_hdr_row(ws_sk, 2)
+
+    has_bad = False
+    for rec in issue_records:
+        if rec.get("error"):
+            continue
+        for line_num, content in rec.get("bad_lines_a", []):
+            _row_colored(ws_sk, [
+                rec["label"], "AS-IS", rec["asis_label"],
+                line_num, content[:500],
+            ], _C_WARN)
+            has_bad = True
+        for line_num, content in rec.get("bad_lines_b", []):
+            _row_colored(ws_sk, [
+                rec["label"], "TO-BE", rec["tobe_label"],
+                line_num, content[:500],
+            ], _C_WARN)
+            has_bad = True
+
+    if not has_bad:
+        ws_sk.append(["(nessuna riga saltata — tutti i file ben formati)"])
+
+    ws_sk.append([])
+    ws_sk.append(["Nota:",
+                  "Le righe elencate hanno un numero di campi diverso dall'header "
+                  "(es. campo contenente il carattere separatore senza virgolette). "
+                  "Vengono escluse dal confronto."])
+    _xl_autofit(ws_sk)
+    # Colonna contenuto riga piu' larga
+    ws_sk.column_dimensions["E"].width = 80
+
     wb.save(output_path)
     return str(output_path)
 
@@ -1290,23 +1372,47 @@ def run_comparison(
 
             if "::" in a_path_str:
                 zp_a, ze_a = a_path_str.split("::", 1)
-                sep_a = sep if sep else detect_separator(zp_a, zip_entry=ze_a)
-                df_a  = read_csv_from_zip(zp_a, ze_a, sep=sep)
+                sep_a  = sep if sep else detect_separator(zp_a, zip_entry=ze_a)
+                df_a   = read_csv_from_zip(zp_a, ze_a, sep=sep)
+                raw_a  = _get_raw_content(zp_a, ze_a)
                 n_ws_a = _detect_whitespace_in_raw(zp_a, ze_a, sep_a)
             else:
-                sep_a = sep if sep else detect_separator(a_path_str)
-                df_a  = read_csv(a_path_str, sep=sep)
+                sep_a  = sep if sep else detect_separator(a_path_str)
+                df_a   = read_csv(a_path_str, sep=sep)
+                raw_a  = _get_raw_content(a_path_str)
                 n_ws_a = _detect_whitespace_in_raw(a_path_str, None, sep_a)
 
             if "::" in b_path_str:
                 zp_b, ze_b = b_path_str.split("::", 1)
-                sep_b = sep if sep else detect_separator(zp_b, zip_entry=ze_b)
-                df_b  = read_csv_from_zip(zp_b, ze_b, sep=sep)
+                sep_b  = sep if sep else detect_separator(zp_b, zip_entry=ze_b)
+                df_b   = read_csv_from_zip(zp_b, ze_b, sep=sep)
+                raw_b  = _get_raw_content(zp_b, ze_b)
                 n_ws_b = _detect_whitespace_in_raw(zp_b, ze_b, sep_b)
             else:
-                sep_b = sep if sep else detect_separator(b_path_str)
-                df_b  = read_csv(b_path_str, sep=sep)
+                sep_b  = sep if sep else detect_separator(b_path_str)
+                df_b   = read_csv(b_path_str, sep=sep)
+                raw_b  = _get_raw_content(b_path_str)
                 n_ws_b = _detect_whitespace_in_raw(b_path_str, None, sep_b)
+
+            # ── Rileva righe saltate ───────────────────────────────────────
+            bad_lines_a = _find_bad_lines(raw_a, sep_a)
+            bad_lines_b = _find_bad_lines(raw_b, sep_b)
+
+            if bad_lines_a:
+                _log(f"  [ATTENZIONE] AS-IS {pair['asis_label']}: "
+                     f"{len(bad_lines_a)} righe saltate (campi non conformi)")
+                for ln, content in bad_lines_a[:5]:
+                    _log(f"    riga {ln}: {content[:120]}")
+                if len(bad_lines_a) > 5:
+                    _log(f"    ... e altre {len(bad_lines_a) - 5} righe")
+
+            if bad_lines_b:
+                _log(f"  [ATTENZIONE] TO-BE {pair['tobe_label']}: "
+                     f"{len(bad_lines_b)} righe saltate (campi non conformi)")
+                for ln, content in bad_lines_b[:5]:
+                    _log(f"    riga {ln}: {content[:120]}")
+                if len(bad_lines_b) > 5:
+                    _log(f"    ... e altre {len(bad_lines_b) - 5} righe")
 
             # ── Genera Excel per coppia ────────────────────────────────────
             out_name = f"confronto_{label}_{ts}.xlsx"
@@ -1333,6 +1439,8 @@ def run_comparison(
                 df_a=df_a, df_b=df_b,
                 sep_a=sep_a, sep_b=sep_b,
                 n_ws_a=n_ws_a, n_ws_b=n_ws_b,
+                bad_lines_a=bad_lines_a,
+                bad_lines_b=bad_lines_b,
             ))
 
             _log(f"  [OK] Excel salvato: {out_name}")
