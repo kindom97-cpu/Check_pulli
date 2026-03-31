@@ -929,29 +929,49 @@ def _get_raw_content(path_str: str, zip_entry: str | None = None) -> str:
 
 def _find_bad_lines(raw: str, sep: str) -> list[tuple[int, str]]:
     """
-    Scorre le righe raw (saltando l'header) e restituisce
-    [(numero_riga_1based, contenuto)] per le righe che pandas ha saltato.
+    Rileva le righe che pandas skipperebbe con on_bad_lines='skip',
+    usando pandas stesso con on_bad_lines='warn' per catturare i ParserWarning.
+    Questo approccio e' immune ai trailing-separator e ad altre varianti
+    perche' e' pandas stesso a decidere quali righe sono malformate.
 
-    Logica:
-    - n_expected = campi nell'header (es. 34 con trailing sep)
-    - righe con n_expected-1 campi sono NORMALI (il trailing sep e' assente
-      nelle righe dati ma presente nell'header) -> non flaggate
-    - righe con piu' di n_expected campi -> campo contiene il separatore
-      senza virgolette -> queste vengono saltate da pandas -> flaggate
-    - righe con meno di n_expected-1 campi -> riga troncata -> flaggate
+    Restituisce [(numero_riga_1based, contenuto_riga)].
     """
-    lines = raw.splitlines()
-    if len(lines) < 2:
-        return []
-    n_expected = len(lines[0].rstrip("\r\n").split(sep))
+    import io as _io
+    import re as _re
+    import warnings as _warnings
+
+    raw_lines = raw.splitlines()
     bad: list[tuple[int, str]] = []
-    for i, line in enumerate(lines[1:], start=2):
-        if not line.strip():
+
+    buf = _io.StringIO(raw)
+    esc = _re.escape(sep) if len(sep) > 1 else sep
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        try:
+            pd.read_csv(
+                buf,
+                sep=esc,
+                engine="python",          # python engine emette ParserWarning
+                on_bad_lines="warn",
+                dtype=str,
+                keep_default_na=False,
+            )
+        except Exception:
+            pass
+
+    for w in caught:
+        if not issubclass(w.category, (pd.errors.ParserWarning, UserWarning)):
             continue
-        n_fields = len(line.rstrip("\r\n").split(sep))
-        # Consenti n_expected-1 (trailing sep solo nell'header e' normale)
-        if n_fields > n_expected or n_fields < n_expected - 1:
-            bad.append((i, line.rstrip("\r\n")))
+        msg = str(w.message)
+        # Formato python engine: "Skipping line N: expected X fields, saw Y"
+        m = (_re.search(r"[Ss]kipping\s+(?:row|line)\s+(\d+)", msg) or
+             _re.search(r"in line\s+(\d+)", msg))
+        if m:
+            ln = int(m.group(1))          # numero riga 1-based nel file
+            if 1 <= ln <= len(raw_lines):
+                bad.append((ln, raw_lines[ln - 1]))
+
     return bad
 
 
