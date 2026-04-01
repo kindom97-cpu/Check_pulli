@@ -180,19 +180,51 @@ def _dedup_columns(cols: list[str]) -> list[str]:
     return result
 
 
+def _has_header_from_text(text: str, sep: str) -> bool:
+    """
+    Euristica robusta per rilevare se la prima riga e' un header o gia' un dato.
+
+    Logica:
+    - I nomi colonna DB/DWH tipici matchano ^[A-Za-z_][A-Za-z0-9_]*$
+      (es. C_FILIALE, N_CONTRATTO, D_DECORRENZA).
+    - Le righe dati contengono di solito ID numerici, date (tutte cifre),
+      importi, ragioni sociali con spazi — che NON matchano quel pattern.
+
+    Regole:
+    1. Se almeno il 50 % dei valori non-vuoti matchano il pattern colonna
+       E almeno uno contiene '_' -> header quasi certo.
+    2. Se almeno il 75 % matchano (anche senza '_') -> header.
+    3. Altrimenti -> dati, nessun header.
+    """
+    lines = [ln.rstrip("\r\n") for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return True
+
+    first_vals = [v.strip().strip('"').strip("'") for v in lines[0].split(sep)]
+    non_empty = [v for v in first_vals if v]
+    if not non_empty:
+        return True
+
+    col_pat = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    col_like = [v for v in non_empty if col_pat.match(v) and not v.isdigit()]
+    ratio = len(col_like) / len(non_empty)
+    has_underscore = any("_" in v for v in col_like)
+
+    if ratio >= 0.50 and has_underscore:
+        return True
+    if ratio >= 0.75:
+        return True
+    return False
+
+
 def _has_header(filepath: str | Path, sep: str = ";") -> bool:
-    """Euristica: True se la prima riga contiene almeno 1 valore non numerico."""
+    """Legge le prime righe del file e delega a _has_header_from_text."""
     try:
         with open(filepath, encoding="utf-8", errors="replace") as fh:
-            first = fh.readline()
-        parts = first.split(sep)
-        for p in parts:
-            p = p.strip().strip('"').strip("'")
-            if p and not re.match(r"^-?\d+(\.\d+)?$", p):
-                return True
+            text = fh.read(16384)          # primi ~16 KB bastano
+        return _has_header_from_text(text, sep)
     except Exception:
-        pass
-    return False
+        return True                        # in caso di errore assume header
 
 
 def read_csv(filepath: str | Path, sep: str | None = None) -> pd.DataFrame:
@@ -222,6 +254,10 @@ def read_csv(filepath: str | Path, sep: str | None = None) -> pd.DataFrame:
         on_bad_lines="skip",
         engine=engine,
     )
+    # Quando non c'e' header pandas assegna interi (0, 1, 2…);
+    # li rinominiamo in Col_1, Col_2, … prima di ogni altro processing.
+    if hdr is None:
+        df.columns = [f"Col_{i + 1}" for i in range(len(df.columns))]
     df.columns = _dedup_columns([str(c).strip() for c in df.columns])
     # Rimuovi colonne-artefatto: nome vuoto o solo caratteri speciali (es. '#', '£')
     df = df[[c for c in df.columns if not _is_artifact_col(c)]]
@@ -275,6 +311,10 @@ def read_csv_from_zip(zip_path: str | Path, csv_name: str, sep: str | None = Non
         on_bad_lines="skip",
         engine=engine,
     )
+    # Quando non c'e' header pandas assegna interi (0, 1, 2…);
+    # li rinominiamo in Col_1, Col_2, … prima di ogni altro processing.
+    if hdr is None:
+        df.columns = [f"Col_{i + 1}" for i in range(len(df.columns))]
     df.columns = _dedup_columns([str(c).strip() for c in df.columns])
     # Rimuovi colonne-artefatto: nome vuoto o solo caratteri speciali (es. '#', '£')
     df = df[[c for c in df.columns if not _is_artifact_col(c)]]
@@ -282,13 +322,6 @@ def read_csv_from_zip(zip_path: str | Path, csv_name: str, sep: str | None = Non
     return df
 
 
-def _has_header_from_text(text: str, sep: str) -> bool:
-    first = text.split("\n")[0] if text else ""
-    for p in first.split(sep):
-        p = p.strip().strip('"').strip("'")
-        if p and not re.match(r"^-?\d+(\.\d+)?$", p):
-            return True
-    return False
 
 
 # ---------------------------------------------------------------------------
