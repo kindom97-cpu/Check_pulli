@@ -697,13 +697,17 @@ def _compare_rows_wide(
         merged = pd.merge(df_a_c, df_b_c, on=key_cols,
                           how="outer", suffixes=("__AS", "__TO"),
                           indicator=True)
+        as_val_cols = [c for c in merged.columns if c.endswith("__AS")]
+        to_val_cols = [c for c in merged.columns if c.endswith("__TO")]
+        # Teniamo SOLO le colonne del lato presente: evita duplicati e colonne
+        # tutte-vuote causate dal rename di __AS e __TO sullo stesso nome base.
         only_as = (merged[merged["_merge"] == "left_only"]
-                   .drop(columns=["_merge"])
-                   .rename(columns=lambda c: c.replace("__AS", "").replace("__TO", ""))
+                   [key_cols + as_val_cols]
+                   .rename(columns=lambda c: c[:-4] if c.endswith("__AS") else c)
                    .head(max_only_rows))
         only_to = (merged[merged["_merge"] == "right_only"]
-                   .drop(columns=["_merge"])
-                   .rename(columns=lambda c: c.replace("__AS", "").replace("__TO", ""))
+                   [key_cols + to_val_cols]
+                   .rename(columns=lambda c: c[:-4] if c.endswith("__TO") else c)
                    .head(max_only_rows))
         both = merged[merged["_merge"] == "both"].drop(columns=["_merge"]).reset_index(drop=True)
     else:
