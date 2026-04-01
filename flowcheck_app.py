@@ -234,6 +234,26 @@ class FlowCheckApp(tk.Tk):
         )
         self._clear_btn.pack(side="right")
 
+        # ── Barra avanzamento ──────────────────────────────────────────
+        prog_outer, prog_inner = _card(outer, padx=14, pady=8)
+        prog_outer.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        row += 1
+
+        self._prog_var   = tk.DoubleVar(value=0)
+        self._prog_label = tk.StringVar(value="")
+
+        self._progressbar = ttk.Progressbar(
+            prog_inner, variable=self._prog_var,
+            maximum=100, mode="determinate", length=500,
+        )
+        self._progressbar.pack(fill="x", pady=(0, 4))
+
+        self._prog_info = tk.Label(
+            prog_inner, textvariable=self._prog_label,
+            font=_F_HINT, bg=_CARD, fg=_MUTED, anchor="w",
+        )
+        self._prog_info.pack(fill="x")
+
         # ── Log ────────────────────────────────────────────────────────
         log_outer, log_inner = _card(outer, padx=0, pady=0)
         log_outer.grid(row=row, column=0, sticky="nsew", pady=(10, 0))
@@ -408,6 +428,22 @@ class FlowCheckApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _log_write(self, msg: str):
+        # Messaggio strutturato di avanzamento: aggiorna barra, non scrive nel log
+        if msg.startswith("[PROGRESS]"):
+            try:
+                parts = msg.split()          # ["[PROGRESS]", "3/10"]
+                done, total = map(int, parts[1].split("/"))
+                pct = (done / total * 100) if total else 0
+                self._prog_var.set(pct)
+                self._prog_label.set(
+                    f"File {done} di {total}  —  "
+                    + ("Completato ✔" if done == total
+                       else f"{100 - pct:.0f}% rimanente")
+                )
+            except Exception:
+                pass
+            return          # non scrivere nel log testuale
+
         self._log.configure(state="normal")
         ml = msg.lower()
         tag = None
@@ -445,11 +481,14 @@ class FlowCheckApp(tk.Tk):
                 state="disabled", text="⏳  Elaborazione in corso…",
                 bg="#6B9BD2", fg=_WHITE)
             self._status_var.set("⏳  Elaborazione in corso…")
+            self._prog_var.set(0)
+            self._prog_label.set("")
         else:
             self._run_btn.configure(
                 state="normal", text="▶   Avvia confronto",
                 bg=_PRIMARY, fg=_WHITE)
             self._status_var.set("✔  Completato")
+            self._prog_var.set(100)
             if self._last_output_dir:
                 self._open_btn.configure(state="normal")
 

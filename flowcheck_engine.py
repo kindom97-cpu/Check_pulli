@@ -1447,11 +1447,24 @@ def run_comparison(
     tobe_list = [(dn, str(zp) if ze is None else f"{zp}::{ze}") for dn, zp, ze in tobe_sources]
 
     pairs = match_files(asis_list, tobe_list)
-    _log(f"Coppie abbinate: {sum(1 for p in pairs if p['tobe_path'])}/{len(pairs)}")
+    total_pairs = sum(1 for p in pairs if p["tobe_path"])
+    _log(f"Coppie abbinate: {total_pairs}/{len(pairs)}")
     _log("")
 
     generated    = []
     issue_records: list[dict] = []
+
+    import time as _time
+
+    def _fmt_time(secs: float) -> str:
+        secs = max(0.0, secs)
+        if secs < 60:
+            return f"{secs:.0f}s"
+        m, s = divmod(int(secs), 60)
+        return f"{m}m {s:02d}s"
+
+    t0   = _time.perf_counter()
+    done = 0
 
     for pair in pairs:
         label = pair["label"]
@@ -1459,6 +1472,7 @@ def run_comparison(
             _log(f"[SKIP] {label} - nessuna controparte TO-BE trovata")
             continue
 
+        t_file_start = _time.perf_counter()
         _log(f"  Confronto: {label} ...")
 
         try:
@@ -1550,6 +1564,20 @@ def run_comparison(
                 "tobe_label": pair.get("tobe_label", ""),
                 "error": str(exc),
             })
+
+        # ── Timing e avanzamento ───────────────────────────────────────
+        done += 1
+        t_file   = _time.perf_counter() - t_file_start
+        t_total  = _time.perf_counter() - t0
+        t_avg    = t_total / done
+        t_eta    = t_avg * (total_pairs - done)
+        timing   = f"  ⏱  File: {_fmt_time(t_file)}"
+        timing  += f"  |  Trascorso: {_fmt_time(t_total)}"
+        if total_pairs - done > 0:
+            timing += f"  |  Stima rimanente: ~{_fmt_time(t_eta)}"
+        _log(timing)
+        # Messaggio strutturato per la barra di avanzamento nella GUI
+        _log(f"[PROGRESS] {done}/{total_pairs}")
 
     # ── Genera issue log Excel ─────────────────────────────────────────────
     if issue_records:
