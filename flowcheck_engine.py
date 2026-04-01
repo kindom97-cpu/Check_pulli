@@ -1431,6 +1431,11 @@ def run_comparison(
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = output_dir / f"flowcheck_errori_{ts}.log"
 
+    if join_key:
+        _log(f"Chiave di join manuale: {', '.join(join_key)}")
+    else:
+        _log("Chiave di join: auto-detect")
+
     asis_sources = enumerate_sources(asis_path)
     tobe_sources = enumerate_sources(tobe_path)
 

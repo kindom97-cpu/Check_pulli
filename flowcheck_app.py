@@ -166,7 +166,41 @@ class FlowCheckApp(tk.Tk):
         self._sep_custom_entry.pack(side="left")
         row += 1
 
-        tk.Frame(body, bg=_BG_LIGHT, height=14).grid(row=row, column=0)
+        tk.Frame(body, bg=_BG_LIGHT, height=8).grid(row=row, column=0)
+        row += 1
+
+        # -- Chiave di join --
+        jk_outer = tk.Frame(body, bg=_BG_LIGHT)
+        jk_outer.grid(row=row, column=0, columnspan=3, sticky="ew")
+
+        tk.Label(jk_outer, text="Chiave di join:", font=_FONT_BOLD,
+                 bg=_BG_LIGHT, fg=_FG_DARK).pack(side="left")
+
+        self._jk_mode_var = tk.StringVar(value="auto")
+
+        tk.Radiobutton(
+            jk_outer, text="Auto-detect", variable=self._jk_mode_var,
+            value="auto", bg=_BG_LIGHT, font=_FONT_LABEL,
+            command=self._on_jk_mode_change,
+        ).pack(side="left", padx=(12, 0))
+
+        tk.Radiobutton(
+            jk_outer, text="Specifica campi:", variable=self._jk_mode_var,
+            value="manual", bg=_BG_LIGHT, font=_FONT_LABEL,
+            command=self._on_jk_mode_change,
+        ).pack(side="left", padx=(8, 0))
+
+        self._jk_var = tk.StringVar(value="")
+        self._jk_entry = ttk.Entry(jk_outer, textvariable=self._jk_var,
+                                   width=38, font=_FONT_LABEL, state="disabled")
+        self._jk_entry.pack(side="left", padx=(4, 0))
+
+        tk.Label(jk_outer, text="(es. POLIZZA  o  POLIZZA,NUM_CONTR)",
+                 font=_FONT_SMALL, bg=_BG_LIGHT, fg="#888888").pack(side="left", padx=(8, 0))
+
+        row += 1
+
+        tk.Frame(body, bg=_BG_LIGHT, height=10).grid(row=row, column=0)
         row += 1
 
         # -- Bottone Avvia --
@@ -257,6 +291,23 @@ class FlowCheckApp(tk.Tk):
         else:
             self._sep_custom_entry.configure(state="disabled")
 
+    def _on_jk_mode_change(self):
+        if self._jk_mode_var.get() == "manual":
+            self._jk_entry.configure(state="normal")
+            self._jk_entry.focus()
+        else:
+            self._jk_entry.configure(state="disabled")
+
+    def _get_join_key(self) -> list[str] | None:
+        """Restituisce None (auto) o la lista di nomi colonna specificati."""
+        if self._jk_mode_var.get() != "manual":
+            return None
+        raw = self._jk_var.get().strip()
+        if not raw:
+            return None
+        cols = [c.strip() for c in raw.split(",") if c.strip()]
+        return cols if cols else None
+
     def _get_sep(self) -> str | None:
         sel = self._sep_combo_var.get()
         if sel.startswith("Auto"):
@@ -322,6 +373,8 @@ class FlowCheckApp(tk.Tk):
         out  = self._out_var.get().strip() or None
         sep  = self._get_sep()
 
+        join_key = self._get_join_key()
+
         if not asis:
             messagebox.showwarning("Input mancante", "Specifica il percorso AS-IS.")
             return
@@ -334,10 +387,12 @@ class FlowCheckApp(tk.Tk):
         self._status_var.set("Elaborazione in corso...")
         self._last_output_dir = out or str(Path(asis).parent if Path(asis).is_file() else asis)
 
-        t = threading.Thread(target=self._worker, args=(asis, tobe, out, sep), daemon=True)
+        t = threading.Thread(
+            target=self._worker, args=(asis, tobe, out, sep, join_key), daemon=True)
         t.start()
 
-    def _worker(self, asis: str, tobe: str, out: str | None, sep: str | None):
+    def _worker(self, asis: str, tobe: str, out: str | None,
+                sep: str | None, join_key: list[str] | None):
         try:
             from flowcheck_engine import run_comparison
             def cb(msg):
@@ -347,6 +402,7 @@ class FlowCheckApp(tk.Tk):
                 tobe_path=tobe,
                 output_dir=out,
                 sep=sep,
+                join_key=join_key,
                 progress_cb=cb,
             )
             if out is None:
