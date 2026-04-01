@@ -23,6 +23,23 @@ from openpyxl.utils import get_column_letter
 # ---------------------------------------------------------------------------
 SEP_CANDIDATES = [";|", ";£", "£|", "|;", "\t", ";", ",", "|", "£"]
 
+
+# ---------------------------------------------------------------------------
+# Rilevamento encoding
+# ---------------------------------------------------------------------------
+
+def _detect_encoding(raw_bytes: bytes) -> str:
+    """
+    Restituisce 'utf-8' se i byte sono UTF-8 valido, altrimenti 'cp1252'.
+    cp1252 (Windows-1252) e' il superset di Latin-1 usato dai file DWH
+    italiani che contengono caratteri come £ (0xA3) o € (0x80).
+    """
+    try:
+        raw_bytes.decode("utf-8", errors="strict")
+        return "utf-8"
+    except UnicodeDecodeError:
+        return "cp1252"
+
 # ---------------------------------------------------------------------------
 # Stili Excel
 # ---------------------------------------------------------------------------
@@ -66,10 +83,15 @@ def _read_first_lines(filepath: Path, n: int = 30,
                     target = csv_names[0] if csv_names else None
                 if target:
                     with zf.open(target) as fh:
-                        raw = fh.read(16384).decode("utf-8", errors="replace")
+                        raw_bytes = fh.read(16384)
+                        enc = _detect_encoding(raw_bytes)
+                        raw = raw_bytes.decode(enc, errors="replace")
                         return raw.splitlines()[:n]
         else:
-            with open(filepath, encoding="utf-8", errors="replace") as fh:
+            with open(filepath, "rb") as fh:
+                raw_bytes = fh.read(16384)
+            enc = _detect_encoding(raw_bytes)
+            with open(filepath, encoding=enc, errors="replace") as fh:
                 return [fh.readline() for _ in range(n)]
     except Exception:
         pass
@@ -218,10 +240,12 @@ def _has_header_from_text(text: str, sep: str) -> bool:
 
 
 def _has_header(filepath: str | Path, sep: str = ";") -> bool:
-    """Legge le prime righe del file e delega a _has_header_from_text."""
+    """Legge le prime righe del file (con encoding auto-detect) e delega a _has_header_from_text."""
     try:
-        with open(filepath, encoding="utf-8", errors="replace") as fh:
-            text = fh.read(16384)          # primi ~16 KB bastano
+        with open(filepath, "rb") as fh:
+            raw_bytes = fh.read(16384)
+        enc = _detect_encoding(raw_bytes)
+        text = raw_bytes.decode(enc, errors="replace")
         return _has_header_from_text(text, sep)
     except Exception:
         return True                        # in caso di errore assume header
@@ -242,12 +266,16 @@ def read_csv(filepath: str | Path, sep: str | None = None) -> pd.DataFrame:
 
     hdr = 0 if _has_header(filepath, sep) else None
 
+    # Rileva encoding prima di passarlo a pandas
+    with open(filepath, "rb") as fh:
+        enc = _detect_encoding(fh.read(16384))
+
     df = pd.read_csv(
         filepath,
         sep=sep_param,
         header=hdr,
         dtype=str,
-        encoding="utf-8",
+        encoding=enc,
         encoding_errors="replace",
         skipinitialspace=True,
         keep_default_na=False,
@@ -296,7 +324,9 @@ def read_csv_from_zip(zip_path: str | Path, csv_name: str, sep: str | None = Non
 
     with zipfile.ZipFile(zip_path) as zf:
         with zf.open(csv_name) as fh:
-            raw = fh.read().decode("utf-8", errors="replace")
+            raw_bytes = fh.read()
+    enc = _detect_encoding(raw_bytes)
+    raw = raw_bytes.decode(enc, errors="replace")
 
     hdr_flag = _has_header_from_text(raw, sep)
     hdr = 0 if hdr_flag else None
@@ -950,14 +980,18 @@ def build_excel_pair(
 # ---------------------------------------------------------------------------
 
 def _get_raw_content(path_str: str, zip_entry: str | None = None) -> str:
-    """Legge il contenuto grezzo da file CSV o da una entry ZIP."""
+    """Legge il contenuto grezzo da file CSV o da una entry ZIP, con encoding auto-detect."""
     if zip_entry:
         with zipfile.ZipFile(path_str) as zf:
             with zf.open(zip_entry) as fh:
-                return fh.read().decode("utf-8", errors="replace")
+                raw_bytes = fh.read()
+        enc = _detect_encoding(raw_bytes)
+        return raw_bytes.decode(enc, errors="replace")
     else:
-        with open(path_str, encoding="utf-8", errors="replace") as fh:
-            return fh.read()
+        with open(path_str, "rb") as fh:
+            raw_bytes = fh.read()
+        enc = _detect_encoding(raw_bytes)
+        return raw_bytes.decode(enc, errors="replace")
 
 
 def _find_bad_lines(raw: str, sep: str) -> list[tuple[int, str]]:
