@@ -1,6 +1,5 @@
 # flowcheck_app.py
-# Interfaccia grafica tkinter per FlowCheck
-# Avvia il confronto CSV/ZIP in background e mostra il progresso in tempo reale
+# Interfaccia grafica tkinter per FlowCheck — design user-friendly
 
 from __future__ import annotations
 
@@ -15,259 +14,347 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 # ---------------------------------------------------------------------------
-# Costanti UI
+# Palette colori
 # ---------------------------------------------------------------------------
-_APP_TITLE  = "FlowCheck  |  Confronto AS-IS vs TO-BE"
-_BG_DARK    = "#1F3864"
-_BG_MED     = "#2E4D87"
-_BG_LIGHT   = "#F5F7FA"
-_ACCENT     = "#2E75B6"
-_FG_WHITE   = "#FFFFFF"
-_FG_DARK    = "#1A1A2E"
-_FG_OK      = "#276221"
-_FG_ERR     = "#9C0006"
-_FG_WARN    = "#9C5700"
-_FONT_TITLE = ("Segoe UI", 15, "bold")
-_FONT_LABEL = ("Segoe UI", 10)
-_FONT_BOLD  = ("Segoe UI", 10, "bold")
-_FONT_MONO  = ("Consolas", 9)
-_FONT_SMALL = ("Segoe UI", 8)
+_BG         = "#F0F4F8"   # sfondo generale
+_CARD       = "#FFFFFF"   # sfondo card
+_HEADER_BG  = "#1E3A5F"   # intestazione
+_HEADER_SUB = "#2E5F9A"
+_PRIMARY    = "#1A6BBF"   # bottone principale
+_PRIMARY_HO = "#155799"   # hover
+_SUCCESS    = "#1A7A4A"
+_MUTED      = "#718096"   # testo secondario
+_BORDER     = "#CBD5E0"   # bordo card
+_TEXT       = "#2D3748"
+_WHITE      = "#FFFFFF"
+
+_F_TITLE  = ("Segoe UI", 16, "bold")
+_F_SUB    = ("Segoe UI",  9)
+_F_LABEL  = ("Segoe UI", 10)
+_F_BOLD   = ("Segoe UI", 10, "bold")
+_F_SECT   = ("Segoe UI", 10, "bold")
+_F_HINT   = ("Segoe UI",  8)
+_F_MONO   = ("Consolas",  9)
+_F_BTN    = ("Segoe UI", 10, "bold")
 
 SEP_OPTIONS = [
-    ("Auto-detect", None),
-    (";  (punto e virgola)", ";"),
-    (",  (virgola)", ","),
-    ("\\t  (tabulazione)", "\t"),
-    ("|  (pipe)", "|"),
-    (";|  (multi)", ";|"),
-    (";£  (multi)", ";£"),
-    ("Personalizzato...", "__custom__"),
+    ("Rilevamento automatico",  None),
+    (";  (punto e virgola)",    ";"),
+    (",  (virgola)",            ","),
+    ("\\t  (tabulazione)",      "\t"),
+    ("|  (pipe)",               "|"),
+    (";|  (composto)",          ";|"),
+    (";£  (composto £)",        ";£"),
+    ("Personalizzato…",         "__custom__"),
 ]
 
 
 # ---------------------------------------------------------------------------
-# Applicazione principale
+# Utilità: card con bordo arrotondato simulato
+# ---------------------------------------------------------------------------
+
+def _card(parent, **kw) -> tk.Frame:
+    """Frame bianco con bordo sottile — simula una card."""
+    outer = tk.Frame(parent, bg=_BORDER, padx=1, pady=1)
+    inner = tk.Frame(outer, bg=_CARD, **kw)
+    inner.pack(fill="both", expand=True)
+    return outer, inner
+
+
+def _hint(parent, text: str):
+    """Etichetta descrittiva grigia sotto un campo."""
+    tk.Label(parent, text=text, font=_F_HINT, bg=_CARD,
+             fg=_MUTED, anchor="w").pack(fill="x", padx=2, pady=(0, 6))
+
+
+def _section_label(parent, text: str):
+    tk.Label(parent, text=text, font=_F_SECT, bg=_CARD,
+             fg=_TEXT).pack(anchor="w", pady=(10, 2))
+
+
+# ---------------------------------------------------------------------------
+# App
 # ---------------------------------------------------------------------------
 
 class FlowCheckApp(tk.Tk):
+
     def __init__(self):
         super().__init__()
-        self.title(_APP_TITLE)
-        self.geometry("900x700")
-        self.minsize(780, 580)
-        self.configure(bg=_BG_LIGHT)
+        self.title("FlowCheck")
+        self.geometry("920x740")
+        self.minsize(800, 620)
+        self.configure(bg=_BG)
         self.resizable(True, True)
 
         self._q: queue.Queue[str | None] = queue.Queue()
         self._running = False
         self._last_output_dir: str | None = None
+        self._adv_visible = False   # pannello opzioni avanzate
 
+        self._apply_style()
         self._build_ui()
         self._poll_queue()
+
+    # ------------------------------------------------------------------
+    # ttk Style
+    # ------------------------------------------------------------------
+
+    def _apply_style(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure("TEntry",    fieldbackground=_WHITE, bordercolor=_BORDER,
+                    relief="flat", padding=5)
+        s.configure("TCombobox", fieldbackground=_WHITE, bordercolor=_BORDER,
+                    padding=5)
+        s.configure("TButton",   background=_BG, relief="flat", padding=(8, 4))
+        s.map("TButton",
+              background=[("active", "#E2E8F0"), ("disabled", "#EDF2F7")],
+              foreground=[("disabled", "#A0AEC0")])
 
     # ------------------------------------------------------------------
     # Costruzione UI
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        # Header
-        hdr = tk.Frame(self, bg=_BG_DARK, height=60)
+        # ── Header ────────────────────────────────────────────────────
+        hdr = tk.Frame(self, bg=_HEADER_BG, height=68)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
-        tk.Label(hdr, text=_APP_TITLE, font=_FONT_TITLE,
-                 bg=_BG_DARK, fg=_FG_WHITE).pack(side="left", padx=20, pady=10)
 
-        # Body
-        body = tk.Frame(self, bg=_BG_LIGHT, padx=20, pady=15)
-        body.pack(fill="both", expand=True)
+        tk.Label(hdr, text="FlowCheck", font=_F_TITLE,
+                 bg=_HEADER_BG, fg=_WHITE).pack(side="left", padx=20, pady=(12, 2),
+                                                anchor="sw")
+        tk.Label(hdr,
+                 text="Confronta automaticamente due versioni di file CSV o ZIP",
+                 font=_F_SUB, bg=_HEADER_BG, fg="#A8C4E0").pack(
+            side="left", padx=(4, 0), pady=(0, 4), anchor="sw")
 
-        # Grid a 3 colonne: label | entry | bottone(i)
-        body.columnconfigure(1, weight=1)
+        # ── Scroll contenitore principale ─────────────────────────────
+        outer = tk.Frame(self, bg=_BG)
+        outer.pack(fill="both", expand=True, padx=18, pady=14)
+        outer.columnconfigure(0, weight=1)
 
         row = 0
 
-        # -- AS-IS --
-        tk.Label(body, text="AS-IS  (CSV / ZIP / Cartella):",
-                 font=_FONT_BOLD, bg=_BG_LIGHT, fg=_FG_DARK).grid(
-            row=row, column=0, sticky="w", pady=(0, 4))
+        # ── Card 1: Scegli i file ─────────────────────────────────────
+        f_outer, f_inner = _card(outer, padx=16, pady=6)
+        f_outer.grid(row=row, column=0, sticky="ew")
+        outer.rowconfigure(row, weight=0)
         row += 1
 
+        tk.Label(f_inner, text="1  Scegli i file", font=("Segoe UI", 11, "bold"),
+                 bg=_CARD, fg=_HEADER_BG).pack(anchor="w", pady=(6, 0))
+
+        # AS-IS
+        _section_label(f_inner, "Versione attuale  (AS-IS)")
         self._asis_var = tk.StringVar()
-        self._asis_entry = ttk.Entry(body, textvariable=self._asis_var, font=_FONT_LABEL)
-        self._asis_entry.grid(row=row, column=0, columnspan=2, sticky="ew", padx=(0, 6))
+        self._build_file_row(f_inner, self._asis_var)
+        _hint(f_inner, "File CSV, archivio ZIP o cartella contenente i dati di partenza")
 
-        btn_frame_a = tk.Frame(body, bg=_BG_LIGHT)
-        btn_frame_a.grid(row=row, column=2, sticky="ew")
-        ttk.Button(btn_frame_a, text="File/ZIP",
-                   command=lambda: self._browse_file(self._asis_var)).pack(side="left", padx=(0, 4))
-        ttk.Button(btn_frame_a, text="Cartella",
-                   command=lambda: self._browse_dir(self._asis_var)).pack(side="left")
-        row += 1
+        # Separatore visivo
+        tk.Frame(f_inner, bg=_BORDER, height=1).pack(fill="x", pady=4)
 
-        tk.Frame(body, bg=_BG_LIGHT, height=10).grid(row=row, column=0)
-        row += 1
-
-        # -- TO-BE --
-        tk.Label(body, text="TO-BE  (CSV / ZIP / Cartella):",
-                 font=_FONT_BOLD, bg=_BG_LIGHT, fg=_FG_DARK).grid(
-            row=row, column=0, sticky="w", pady=(0, 4))
-        row += 1
-
+        # TO-BE
+        _section_label(f_inner, "Nuova versione  (TO-BE)")
         self._tobe_var = tk.StringVar()
-        self._tobe_entry = ttk.Entry(body, textvariable=self._tobe_var, font=_FONT_LABEL)
-        self._tobe_entry.grid(row=row, column=0, columnspan=2, sticky="ew", padx=(0, 6))
+        self._build_file_row(f_inner, self._tobe_var)
+        _hint(f_inner, "File CSV, archivio ZIP o cartella con i nuovi dati da confrontare")
 
-        btn_frame_b = tk.Frame(body, bg=_BG_LIGHT)
-        btn_frame_b.grid(row=row, column=2, sticky="ew")
-        ttk.Button(btn_frame_b, text="File/ZIP",
-                   command=lambda: self._browse_file(self._tobe_var)).pack(side="left", padx=(0, 4))
-        ttk.Button(btn_frame_b, text="Cartella",
-                   command=lambda: self._browse_dir(self._tobe_var)).pack(side="left")
-        row += 1
+        # Separatore visivo
+        tk.Frame(f_inner, bg=_BORDER, height=1).pack(fill="x", pady=4)
 
-        tk.Frame(body, bg=_BG_LIGHT, height=10).grid(row=row, column=0)
-        row += 1
-
-        # -- Output dir --
-        tk.Label(body, text="Cartella output:",
-                 font=_FONT_BOLD, bg=_BG_LIGHT, fg=_FG_DARK).grid(
-            row=row, column=0, sticky="w", pady=(0, 4))
-        row += 1
-
+        # Output
+        _section_label(f_inner, "Dove salvare i risultati  (facoltativo)")
+        out_row = tk.Frame(f_inner, bg=_CARD)
+        out_row.pack(fill="x")
         self._out_var = tk.StringVar()
-        ttk.Entry(body, textvariable=self._out_var, font=_FONT_LABEL).grid(
-            row=row, column=0, columnspan=2, sticky="ew", padx=(0, 6))
-        ttk.Button(body, text="Sfoglia",
-                   command=lambda: self._browse_dir(self._out_var)).grid(
-            row=row, column=2, sticky="w")
+        ttk.Entry(out_row, textvariable=self._out_var,
+                  font=_F_LABEL).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(out_row, text="📁  Sfoglia",
+                   command=lambda: self._browse_dir(self._out_var)).pack(side="left")
+        _hint(f_inner, "Se non indicato, i file vengono salvati nella stessa cartella dell'AS-IS")
+
+        # ── Pannello avanzate (toggle) ─────────────────────────────────
+        adv_toggle_row = tk.Frame(outer, bg=_BG)
+        adv_toggle_row.grid(row=row, column=0, sticky="ew", pady=(8, 0))
         row += 1
 
-        tk.Frame(body, bg=_BG_LIGHT, height=10).grid(row=row, column=0)
+        self._adv_btn = tk.Button(
+            adv_toggle_row,
+            text="▶  Impostazioni avanzate  (separatore, chiave di collegamento)",
+            font=_F_HINT, bg=_BG, fg=_PRIMARY, relief="flat",
+            cursor="hand2", activebackground=_BG, activeforeground=_PRIMARY_HO,
+            command=self._toggle_advanced,
+        )
+        self._adv_btn.pack(anchor="w")
+
+        # Card opzioni avanzate (nascosta di default)
+        self._adv_outer, self._adv_inner = _card(outer, padx=16, pady=8)
+        # NON grid: viene mostrata/nascosta da _toggle_advanced
+        self._adv_row = row          # riga da usare se visible
         row += 1
 
-        # -- Separatore --
-        sep_row = tk.Frame(body, bg=_BG_LIGHT)
-        sep_row.grid(row=row, column=0, columnspan=3, sticky="w")
-        tk.Label(sep_row, text="Separatore CSV:", font=_FONT_BOLD,
-                 bg=_BG_LIGHT, fg=_FG_DARK).pack(side="left")
+        self._build_advanced(self._adv_inner)
 
-        self._sep_combo_var = tk.StringVar(value=SEP_OPTIONS[0][0])
-        sep_combo = ttk.Combobox(sep_row, textvariable=self._sep_combo_var,
-                                 values=[o[0] for o in SEP_OPTIONS],
-                                 state="readonly", width=25, font=_FONT_LABEL)
-        sep_combo.pack(side="left", padx=10)
-        sep_combo.bind("<<ComboboxSelected>>", self._on_sep_change)
-
-        tk.Label(sep_row, text="Valore:", font=_FONT_LABEL,
-                 bg=_BG_LIGHT, fg=_FG_DARK).pack(side="left", padx=(10, 4))
-        self._sep_custom_var = tk.StringVar(value="")
-        self._sep_custom_entry = ttk.Entry(sep_row, textvariable=self._sep_custom_var,
-                                           width=8, font=_FONT_LABEL, state="disabled")
-        self._sep_custom_entry.pack(side="left")
+        # ── Bottoni azione ─────────────────────────────────────────────
+        btn_card_outer, btn_card = _card(outer, padx=16, pady=10)
+        btn_card_outer.grid(row=row, column=0, sticky="ew", pady=(10, 0))
         row += 1
 
-        tk.Frame(body, bg=_BG_LIGHT, height=8).grid(row=row, column=0)
-        row += 1
-
-        # -- Chiave di join --
-        jk_outer = tk.Frame(body, bg=_BG_LIGHT)
-        jk_outer.grid(row=row, column=0, columnspan=3, sticky="ew")
-
-        tk.Label(jk_outer, text="Chiave di join:", font=_FONT_BOLD,
-                 bg=_BG_LIGHT, fg=_FG_DARK).pack(side="left")
-
-        self._jk_mode_var = tk.StringVar(value="auto")
-
-        tk.Radiobutton(
-            jk_outer, text="Auto-detect", variable=self._jk_mode_var,
-            value="auto", bg=_BG_LIGHT, font=_FONT_LABEL,
-            command=self._on_jk_mode_change,
-        ).pack(side="left", padx=(12, 0))
-
-        tk.Radiobutton(
-            jk_outer, text="Specifica campi:", variable=self._jk_mode_var,
-            value="manual", bg=_BG_LIGHT, font=_FONT_LABEL,
-            command=self._on_jk_mode_change,
-        ).pack(side="left", padx=(8, 0))
-
-        self._jk_var = tk.StringVar(value="")
-        self._jk_entry = ttk.Entry(jk_outer, textvariable=self._jk_var,
-                                   width=38, font=_FONT_LABEL, state="disabled")
-        self._jk_entry.pack(side="left", padx=(4, 0))
-
-        tk.Label(jk_outer, text="(es. POLIZZA  o  POLIZZA,NUM_CONTR)",
-                 font=_FONT_SMALL, bg=_BG_LIGHT, fg="#888888").pack(side="left", padx=(8, 0))
-
-        row += 1
-
-        tk.Frame(body, bg=_BG_LIGHT, height=10).grid(row=row, column=0)
-        row += 1
-
-        # -- Bottone Avvia --
-        btn_row = tk.Frame(body, bg=_BG_LIGHT)
-        btn_row.grid(row=row, column=0, columnspan=3, sticky="ew")
+        btn_left = tk.Frame(btn_card, bg=_CARD)
+        btn_left.pack(side="left", fill="x", expand=True)
 
         self._run_btn = tk.Button(
-            btn_row, text="  Avvia Confronto  ",
-            font=_FONT_BOLD, bg=_ACCENT, fg=_FG_WHITE,
-            activebackground=_BG_MED, activeforeground=_FG_WHITE,
-            relief="flat", padx=16, pady=6, cursor="hand2",
+            btn_left,
+            text="▶   Avvia confronto",
+            font=_F_BTN, bg=_PRIMARY, fg=_WHITE,
+            activebackground=_PRIMARY_HO, activeforeground=_WHITE,
+            relief="flat", padx=22, pady=8, cursor="hand2",
             command=self._start_comparison,
         )
         self._run_btn.pack(side="left")
 
         self._open_btn = tk.Button(
-            btn_row, text="  Apri cartella output  ",
-            font=_FONT_LABEL, bg="#E8ECF3", fg=_FG_DARK,
-            activebackground="#D0D8E8", relief="flat", padx=12, pady=6,
-            cursor="hand2", state="disabled",
+            btn_left,
+            text="📂  Apri risultati",
+            font=_F_LABEL, bg=_BG, fg=_TEXT,
+            activebackground="#E2E8F0", relief="flat",
+            padx=14, pady=8, cursor="hand2", state="disabled",
             command=self._open_output_folder,
         )
-        self._open_btn.pack(side="left", padx=12)
+        self._open_btn.pack(side="left", padx=10)
 
         self._clear_btn = tk.Button(
-            btn_row, text="Pulisci log",
-            font=_FONT_SMALL, bg="#E8ECF3", fg=_FG_DARK,
-            relief="flat", padx=8, pady=6, cursor="hand2",
+            btn_left,
+            text="✕  Pulisci log",
+            font=_F_HINT, bg=_BG, fg=_MUTED,
+            activebackground="#E2E8F0", relief="flat",
+            padx=10, pady=8, cursor="hand2",
             command=self._clear_log,
         )
         self._clear_btn.pack(side="right")
+
+        # ── Log ────────────────────────────────────────────────────────
+        log_outer, log_inner = _card(outer, padx=0, pady=0)
+        log_outer.grid(row=row, column=0, sticky="nsew", pady=(10, 0))
+        outer.rowconfigure(row, weight=1)
         row += 1
 
-        tk.Frame(body, bg=_BG_LIGHT, height=10).grid(row=row, column=0)
-        row += 1
-
-        # -- Log area --
-        tk.Label(body, text="Log elaborazione:", font=_FONT_BOLD,
-                 bg=_BG_LIGHT, fg=_FG_DARK).grid(
-            row=row, column=0, columnspan=3, sticky="w")
-        row += 1
-
-        log_frame = tk.Frame(body, bg=_BG_LIGHT)
-        log_frame.grid(row=row, column=0, columnspan=3, sticky="nsew")
-        body.rowconfigure(row, weight=1)
+        log_hdr = tk.Frame(log_inner, bg="#161B22", height=28)
+        log_hdr.pack(fill="x")
+        log_hdr.pack_propagate(False)
+        tk.Label(log_hdr, text="  Registro elaborazione",
+                 font=_F_HINT, bg="#161B22", fg="#8B949E",
+                 anchor="w").pack(fill="both", expand=True, padx=4)
 
         self._log = ScrolledText(
-            log_frame, font=_FONT_MONO, bg="#0D1117", fg="#C9D1D9",
+            log_inner, font=_F_MONO, bg="#0D1117", fg="#C9D1D9",
             insertbackground="white", relief="flat",
-            wrap="word", state="disabled",
+            wrap="word", state="disabled", height=10,
         )
         self._log.pack(fill="both", expand=True)
 
-        # Tag colori nel log
-        self._log.tag_configure("ok",   foreground="#3FB950")
-        self._log.tag_configure("err",  foreground="#F85149")
-        self._log.tag_configure("warn", foreground="#D29922")
-        self._log.tag_configure("info", foreground="#58A6FF")
-        self._log.tag_configure("dim",  foreground="#8B949E")
-        row += 1
+        for tag, color in [("ok",   "#3FB950"), ("err",  "#F85149"),
+                           ("warn", "#D29922"), ("info", "#58A6FF"),
+                           ("dim",  "#8B949E")]:
+            self._log.tag_configure(tag, foreground=color)
 
-        # -- Status bar --
-        self._status_var = tk.StringVar(value="Pronto.")
-        status_bar = tk.Label(self, textvariable=self._status_var,
-                              font=_FONT_SMALL, bg=_BG_DARK, fg=_FG_WHITE,
-                              anchor="w", padx=10)
-        status_bar.pack(fill="x", side="bottom")
+        # ── Status bar ─────────────────────────────────────────────────
+        self._status_var = tk.StringVar(value="✔  Pronto")
+        tk.Label(self, textvariable=self._status_var,
+                 font=_F_HINT, bg=_HEADER_BG, fg="#A8C4E0",
+                 anchor="w", padx=14).pack(fill="x", side="bottom")
+
+    # ------------------------------------------------------------------
+    # File row helper
+    # ------------------------------------------------------------------
+
+    def _build_file_row(self, parent: tk.Frame, var: tk.StringVar):
+        row = tk.Frame(parent, bg=_CARD)
+        row.pack(fill="x", pady=(0, 2))
+        ttk.Entry(row, textvariable=var,
+                  font=_F_LABEL).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(row, text="📄  File / ZIP",
+                   command=lambda: self._browse_file(var)).pack(side="left", padx=(0, 4))
+        ttk.Button(row, text="📁  Cartella",
+                   command=lambda: self._browse_dir(var)).pack(side="left")
+
+    # ------------------------------------------------------------------
+    # Pannello avanzate
+    # ------------------------------------------------------------------
+
+    def _build_advanced(self, parent: tk.Frame):
+        tk.Label(parent, text="Impostazioni avanzate", font=("Segoe UI", 10, "bold"),
+                 bg=_CARD, fg=_HEADER_BG).pack(anchor="w", pady=(4, 8))
+
+        # Separatore
+        sep_frame = tk.Frame(parent, bg=_CARD)
+        sep_frame.pack(fill="x", pady=(0, 4))
+
+        tk.Label(sep_frame, text="Separatore campi:", font=_F_LABEL,
+                 bg=_CARD, fg=_TEXT, width=22, anchor="w").pack(side="left")
+
+        self._sep_combo_var = tk.StringVar(value=SEP_OPTIONS[0][0])
+        sep_cb = ttk.Combobox(sep_frame, textvariable=self._sep_combo_var,
+                              values=[o[0] for o in SEP_OPTIONS],
+                              state="readonly", width=26, font=_F_LABEL)
+        sep_cb.pack(side="left", padx=(0, 10))
+        sep_cb.bind("<<ComboboxSelected>>", self._on_sep_change)
+
+        self._sep_custom_var = tk.StringVar()
+        self._sep_custom_entry = ttk.Entry(sep_frame, textvariable=self._sep_custom_var,
+                                           width=8, font=_F_LABEL, state="disabled")
+        self._sep_custom_entry.pack(side="left")
+        tk.Label(sep_frame, text="← solo per «Personalizzato»",
+                 font=_F_HINT, bg=_CARD, fg=_MUTED).pack(side="left", padx=6)
+
+        _hint(parent,
+              "Di solito il rilevamento automatico funziona correttamente. "
+              "Cambia solo se i dati vengono letti in modo errato.")
+
+        tk.Frame(parent, bg=_BORDER, height=1).pack(fill="x", pady=6)
+
+        # Chiave di collegamento
+        jk_label_row = tk.Frame(parent, bg=_CARD)
+        jk_label_row.pack(fill="x", pady=(0, 4))
+        tk.Label(jk_label_row, text="Chiave di collegamento:", font=_F_LABEL,
+                 bg=_CARD, fg=_TEXT, width=22, anchor="w").pack(side="left")
+
+        self._jk_mode_var = tk.StringVar(value="auto")
+
+        tk.Radiobutton(jk_label_row, text="Automatica",
+                       variable=self._jk_mode_var, value="auto",
+                       bg=_CARD, font=_F_LABEL,
+                       command=self._on_jk_mode_change).pack(side="left")
+        tk.Radiobutton(jk_label_row, text="Personalizzata:",
+                       variable=self._jk_mode_var, value="manual",
+                       bg=_CARD, font=_F_LABEL,
+                       command=self._on_jk_mode_change).pack(side="left", padx=(14, 0))
+
+        self._jk_var = tk.StringVar()
+        self._jk_entry = ttk.Entry(jk_label_row, textvariable=self._jk_var,
+                                   width=32, font=_F_LABEL, state="disabled")
+        self._jk_entry.pack(side="left", padx=(4, 8))
+
+        _hint(parent,
+              "Campo (o campi separati da virgola) usato per abbinare le righe tra i due file.  "
+              "Es.: POLIZZA   oppure   POLIZZA,TIPO_MOV")
+
+    # ------------------------------------------------------------------
+    # Toggle pannello avanzate
+    # ------------------------------------------------------------------
+
+    def _toggle_advanced(self):
+        self._adv_visible = not self._adv_visible
+        if self._adv_visible:
+            self._adv_outer.grid(row=self._adv_row, column=0,
+                                 sticky="ew", pady=(4, 0))
+            self._adv_btn.configure(
+                text="▼  Impostazioni avanzate  (separatore, chiave di collegamento)")
+        else:
+            self._adv_outer.grid_remove()
+            self._adv_btn.configure(
+                text="▶  Impostazioni avanzate  (separatore, chiave di collegamento)")
 
     # ------------------------------------------------------------------
     # Helpers UI
@@ -285,9 +372,9 @@ class FlowCheckApp(tk.Tk):
             var.set(p)
 
     def _on_sep_change(self, _event=None):
-        sel = self._sep_combo_var.get()
-        if sel.startswith("Personalizzato"):
+        if self._sep_combo_var.get().startswith("Personalizzato"):
             self._sep_custom_entry.configure(state="normal")
+            self._sep_custom_entry.focus()
         else:
             self._sep_custom_entry.configure(state="disabled")
 
@@ -298,19 +385,9 @@ class FlowCheckApp(tk.Tk):
         else:
             self._jk_entry.configure(state="disabled")
 
-    def _get_join_key(self) -> list[str] | None:
-        """Restituisce None (auto) o la lista di nomi colonna specificati."""
-        if self._jk_mode_var.get() != "manual":
-            return None
-        raw = self._jk_var.get().strip()
-        if not raw:
-            return None
-        cols = [c.strip() for c in raw.split(",") if c.strip()]
-        return cols if cols else None
-
     def _get_sep(self) -> str | None:
         sel = self._sep_combo_var.get()
-        if sel.startswith("Auto"):
+        if sel.startswith("Rilevamento"):
             return None
         if sel.startswith("Personalizzato"):
             return self._sep_custom_var.get() or None
@@ -319,24 +396,29 @@ class FlowCheckApp(tk.Tk):
                 return val
         return None
 
+    def _get_join_key(self) -> list[str] | None:
+        if self._jk_mode_var.get() != "manual":
+            return None
+        raw = self._jk_var.get().strip()
+        cols = [c.strip() for c in raw.split(",") if c.strip()]
+        return cols if cols else None
+
+    # ------------------------------------------------------------------
+    # Log
+    # ------------------------------------------------------------------
+
     def _log_write(self, msg: str):
         self._log.configure(state="normal")
-        tag = None
         ml = msg.lower()
-        if "[ok]" in ml:
-            tag = "ok"
-        elif "[errore]" in ml or "error" in ml:
-            tag = "err"
-        elif "[skip]" in ml or "[attenzione]" in ml or "warn" in ml:
-            tag = "warn"
-        elif msg.startswith("AS-IS") or msg.startswith("TO-BE") or msg.startswith("Cop"):
+        tag = None
+        if "[ok]" in ml:                                   tag = "ok"
+        elif "[errore]" in ml or "traceback" in ml:        tag = "err"
+        elif "[attenzione]" in ml or "[skip]" in ml:       tag = "warn"
+        elif msg.startswith("AS-IS") or msg.startswith("TO-BE") \
+             or msg.startswith("Cop") or msg.startswith("Chi"):
             tag = "info"
-        elif msg.startswith("  ") or msg.startswith("---"):
-            tag = "dim"
-        if tag:
-            self._log.insert("end", msg + "\n", tag)
-        else:
-            self._log.insert("end", msg + "\n")
+        elif msg.startswith("  ") or msg.startswith("---"): tag = "dim"
+        self._log.insert("end", msg + "\n", tag or "")
         self._log.see("end")
         self._log.configure(state="disabled")
 
@@ -352,64 +434,73 @@ class FlowCheckApp(tk.Tk):
             else:
                 subprocess.Popen(["xdg-open", self._last_output_dir])
 
+    # ------------------------------------------------------------------
+    # Stato bottone principale
+    # ------------------------------------------------------------------
+
     def _set_running(self, running: bool):
         self._running = running
-        state = "disabled" if running else "normal"
-        self._run_btn.configure(
-            state=state,
-            text="  Elaborazione in corso...  " if running else "  Avvia Confronto  ",
-            bg="#888" if running else _ACCENT,
-        )
-        if not running and self._last_output_dir:
-            self._open_btn.configure(state="normal")
+        if running:
+            self._run_btn.configure(
+                state="disabled", text="⏳  Elaborazione in corso…",
+                bg="#6B9BD2", fg=_WHITE)
+            self._status_var.set("⏳  Elaborazione in corso…")
+        else:
+            self._run_btn.configure(
+                state="normal", text="▶   Avvia confronto",
+                bg=_PRIMARY, fg=_WHITE)
+            self._status_var.set("✔  Completato")
+            if self._last_output_dir:
+                self._open_btn.configure(state="normal")
 
     # ------------------------------------------------------------------
     # Avvio confronto
     # ------------------------------------------------------------------
 
     def _start_comparison(self):
-        asis = self._asis_var.get().strip()
-        tobe = self._tobe_var.get().strip()
-        out  = self._out_var.get().strip() or None
-        sep  = self._get_sep()
-
+        asis     = self._asis_var.get().strip()
+        tobe     = self._tobe_var.get().strip()
+        out      = self._out_var.get().strip() or None
+        sep      = self._get_sep()
         join_key = self._get_join_key()
 
         if not asis:
-            messagebox.showwarning("Input mancante", "Specifica il percorso AS-IS.")
+            messagebox.showwarning(
+                "File mancante",
+                "Seleziona il file (o la cartella) con la versione attuale (AS-IS).")
             return
         if not tobe:
-            messagebox.showwarning("Input mancante", "Specifica il percorso TO-BE.")
+            messagebox.showwarning(
+                "File mancante",
+                "Seleziona il file (o la cartella) con la nuova versione (TO-BE).")
             return
 
         self._clear_log()
         self._set_running(True)
-        self._status_var.set("Elaborazione in corso...")
-        self._last_output_dir = out or str(Path(asis).parent if Path(asis).is_file() else asis)
+        self._last_output_dir = out or str(
+            Path(asis).parent if Path(asis).is_file() else asis)
 
-        t = threading.Thread(
-            target=self._worker, args=(asis, tobe, out, sep, join_key), daemon=True)
-        t.start()
+        threading.Thread(
+            target=self._worker,
+            args=(asis, tobe, out, sep, join_key),
+            daemon=True,
+        ).start()
 
     def _worker(self, asis: str, tobe: str, out: str | None,
                 sep: str | None, join_key: list[str] | None):
         try:
             from flowcheck_engine import run_comparison
-            def cb(msg):
-                self._q.put(msg)
             generated = run_comparison(
                 asis_path=asis,
                 tobe_path=tobe,
                 output_dir=out,
                 sep=sep,
                 join_key=join_key,
-                progress_cb=cb,
+                progress_cb=self._q.put,
             )
-            if out is None:
-                # aggiorna la cartella output rilevata
-                if generated:
-                    self._last_output_dir = str(Path(generated[0]).parent)
-            self._q.put(None)  # segnale di fine
+            if out is None and generated:
+                self._last_output_dir = str(Path(generated[0]).parent)
+            self._q.put(None)
         except Exception as exc:
             import traceback
             self._q.put(f"[ERRORE] {exc}")
@@ -426,7 +517,6 @@ class FlowCheckApp(tk.Tk):
                 msg = self._q.get_nowait()
                 if msg is None:
                     self._set_running(False)
-                    self._status_var.set("Completato.")
                 else:
                     self._log_write(msg)
         except queue.Empty:
