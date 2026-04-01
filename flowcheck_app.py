@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import queue
 import sys
+import time
 import threading
 import subprocess
 from pathlib import Path
@@ -235,24 +236,57 @@ class FlowCheckApp(tk.Tk):
         self._clear_btn.pack(side="right")
 
         # ── Barra avanzamento ──────────────────────────────────────────
-        prog_outer, prog_inner = _card(outer, padx=14, pady=8)
+        prog_outer, prog_inner = _card(outer, padx=14, pady=10)
         prog_outer.grid(row=row, column=0, sticky="ew", pady=(8, 0))
         row += 1
 
-        self._prog_var   = tk.DoubleVar(value=0)
-        self._prog_label = tk.StringVar(value="")
+        # Intestazione card
+        prog_hdr = tk.Frame(prog_inner, bg=_CARD)
+        prog_hdr.pack(fill="x", pady=(0, 6))
+        tk.Label(prog_hdr, text="Avanzamento", font=("Segoe UI", 9, "bold"),
+                 bg=_CARD, fg=_TEXT).pack(side="left")
+        self._prog_pct_label = tk.Label(prog_hdr, text="", font=("Segoe UI", 9, "bold"),
+                                        bg=_CARD, fg=_PRIMARY)
+        self._prog_pct_label.pack(side="right")
 
+        # Barra
+        s = ttk.Style()
+        s.configure("fc.Horizontal.TProgressbar",
+                    troughcolor="#E2E8F0", background=_PRIMARY,
+                    thickness=16)
+        s.configure("fc_done.Horizontal.TProgressbar",
+                    troughcolor="#E2E8F0", background=_SUCCESS,
+                    thickness=16)
+        self._prog_var = tk.DoubleVar(value=0)
         self._progressbar = ttk.Progressbar(
             prog_inner, variable=self._prog_var,
-            maximum=100, mode="determinate", length=500,
+            maximum=100, mode="determinate",
+            style="fc.Horizontal.TProgressbar",
         )
-        self._progressbar.pack(fill="x", pady=(0, 4))
+        self._progressbar.pack(fill="x", pady=(0, 8))
 
-        self._prog_info = tk.Label(
-            prog_inner, textvariable=self._prog_label,
-            font=_F_HINT, bg=_CARD, fg=_MUTED, anchor="w",
+        # Riga info: file corrente + timer
+        info_row = tk.Frame(prog_inner, bg=_CARD)
+        info_row.pack(fill="x")
+
+        self._prog_file_label = tk.Label(
+            info_row, text="", font=_F_HINT, bg=_CARD,
+            fg=_TEXT, anchor="w",
         )
-        self._prog_info.pack(fill="x")
+        self._prog_file_label.pack(side="left")
+
+        self._prog_time_label = tk.Label(
+            info_row, text="", font=("Consolas", 9),
+            bg=_CARD, fg=_MUTED, anchor="e",
+        )
+        self._prog_time_label.pack(side="right")
+
+        # Stato interno timer
+        self._prog_t_run_start: float | None = None
+        self._prog_t_file_start: float | None = None
+        self._prog_timer_id: str | None = None
+        self._prog_total = 1
+        self._prog_done  = 0
 
         # ── Log ────────────────────────────────────────────────────────
         log_outer, log_inner = _card(outer, padx=0, pady=0)
@@ -428,18 +462,54 @@ class FlowCheckApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _log_write(self, msg: str):
-        # Messaggio strutturato di avanzamento: aggiorna barra, non scrive nel log
+
+        # ── [FILE_START] N/M label ─────────────────────────────────────
+        if msg.startswith("[FILE_START]"):
+            try:
+                _, progress, *label_parts = msg.split()   # [FILE_START] 2/10 NOME
+                done_str, total_str = progress.split("/")
+                done  = int(done_str)
+                total = int(total_str)
+                label = " ".join(label_parts)
+                self._prog_total       = total
+                self._prog_done        = done - 1          # non ancora completato
+                self._prog_t_file_start = time.perf_counter()
+                # Barra indeterminate per segnalare "in lavorazione"
+                self._progressbar.stop()
+                self._progressbar.configure(
+                    mode="indeterminate", style="fc.Horizontal.TProgressbar")
+                self._progressbar.start(12)
+                pct_done = ((done - 1) / total * 100) if total else 0
+                self._prog_pct_label.configure(
+                    text=f"File {done} di {total}  ({pct_done:.0f}% completato)",
+                    fg=_PRIMARY)
+                self._prog_file_label.configure(
+                    text=f"▶  In elaborazione:  {label}")
+            except Exception:
+                pass
+            return
+
+        # ── [PROGRESS] done/total ──────────────────────────────────────
         if msg.startswith("[PROGRESS]"):
             try:
-                parts = msg.split()          # ["[PROGRESS]", "3/10"]
-                done, total = map(int, parts[1].split("/"))
-                pct = (done / total * 100) if total else 0
+                _, progress = msg.split()
+                done, total = map(int, progress.split("/"))
+                self._prog_done  = done
+                self._prog_total = total
+                # Ferma indeterminate, passa a determinate
+                self._progressbar.stop()
+                pct = (done / total * 100) if total else 100
+                self._progressbar.configure(
+                    mode="determinate", style="fc.Horizontal.TProgressbar")
                 self._prog_var.set(pct)
-                self._prog_label.set(
-                    f"File {done} di {total}  —  "
-                    + ("Completato ✔" if done == total
-                       else f"{100 - pct:.0f}% rimanente")
-                )
+                self._prog_pct_label.configure(
+                    text=f"File {done} di {total}  ({pct:.0f}%)",
+                    fg=_PRIMARY)
+                if done == total:
+                    self._prog_file_label.configure(text="")
+                else:
+                    self._prog_file_label.configure(
+                        text=f"✔  File completato  —  {total - done} rimasti")
             except Exception:
                 pass
             return          # non scrivere nel log testuale
@@ -474,6 +544,34 @@ class FlowCheckApp(tk.Tk):
     # Stato bottone principale
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Timer live
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fmt(secs: float) -> str:
+        secs = max(0.0, secs)
+        if secs < 60:
+            return f"{secs:4.0f}s"
+        m, s = divmod(int(secs), 60)
+        return f"{m}m {s:02d}s"
+
+    def _tick_timer(self):
+        """Aggiorna etichetta elapsed ogni 500 ms finché il run è attivo."""
+        if not self._running:
+            return
+        import time
+        now = time.perf_counter()
+        t_run  = now - self._prog_t_run_start  if self._prog_t_run_start  else 0.0
+        t_file = now - self._prog_t_file_start if self._prog_t_file_start else 0.0
+        self._prog_time_label.configure(
+            text=f"⏱  file {self._fmt(t_file)}  |  totale {self._fmt(t_run)}")
+        self._prog_timer_id = self.after(500, self._tick_timer)
+
+    # ------------------------------------------------------------------
+    # Stato bottone principale
+    # ------------------------------------------------------------------
+
     def _set_running(self, running: bool):
         self._running = running
         if running:
@@ -481,14 +579,35 @@ class FlowCheckApp(tk.Tk):
                 state="disabled", text="⏳  Elaborazione in corso…",
                 bg="#6B9BD2", fg=_WHITE)
             self._status_var.set("⏳  Elaborazione in corso…")
+            # Reset avanzamento
             self._prog_var.set(0)
-            self._prog_label.set("")
+            self._prog_pct_label.configure(text="")
+            self._prog_file_label.configure(text="Avvio…")
+            self._prog_time_label.configure(text="")
+            self._progressbar.configure(
+                mode="indeterminate", style="fc.Horizontal.TProgressbar")
+            self._progressbar.start(12)
+            # Avvia timer live
+            self._prog_t_run_start  = time.perf_counter()
+            self._prog_t_file_start = time.perf_counter()
+            self._prog_done  = 0
+            self._prog_total = 1
+            self._prog_timer_id = self.after(500, self._tick_timer)
         else:
+            # Ferma timer e animazione
+            if self._prog_timer_id:
+                self.after_cancel(self._prog_timer_id)
+                self._prog_timer_id = None
+            self._progressbar.stop()
+            self._progressbar.configure(
+                mode="determinate", style="fc_done.Horizontal.TProgressbar")
+            self._prog_var.set(100)
+            self._prog_pct_label.configure(text="Completato ✔", fg=_SUCCESS)
+            self._prog_file_label.configure(text="")
             self._run_btn.configure(
                 state="normal", text="▶   Avvia confronto",
                 bg=_PRIMARY, fg=_WHITE)
             self._status_var.set("✔  Completato")
-            self._prog_var.set(100)
             if self._last_output_dir:
                 self._open_btn.configure(state="normal")
 

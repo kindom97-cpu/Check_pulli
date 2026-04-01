@@ -1473,6 +1473,7 @@ def run_comparison(
             continue
 
         t_file_start = _time.perf_counter()
+        _log(f"[FILE_START] {done + 1}/{total_pairs} {label}")
         _log(f"  Confronto: {label} ...")
 
         try:
