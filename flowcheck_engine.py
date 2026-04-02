@@ -1290,9 +1290,15 @@ def build_excel_pair_large(
 
     try:
         conn = _sqlite3.connect(db_path)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA cache_size=-262144")   # 256 MB cache SQLite
+        # ── PRAGMA per performance su DB temporanei di grandi dimensioni ──────
+        # page_size va impostato PRIMA di qualsiasi INSERT (nuovo DB vuoto)
+        conn.execute("PRAGMA page_size=65536")        # 64 KB/pagina → meno I/O sequenziale
+        conn.execute("PRAGMA journal_mode=MEMORY")    # journal in RAM, no file di rollback
+        conn.execute("PRAGMA synchronous=OFF")        # DB temporaneo: no crash recovery
+        conn.execute("PRAGMA cache_size=-2097152")    # 2 GB di cache SQLite
+        conn.execute("PRAGMA temp_store=MEMORY")      # tabelle temp in RAM
+        conn.execute("PRAGMA mmap_size=8589934592")   # 8 GB memory-mapped I/O
+        conn.execute("PRAGMA locking_mode=EXCLUSIVE") # nessun overhead di lock multi-processo
 
         # ── Caricamento ──────────────────────────────────────────────────────
         _log("    Caricamento AS-IS → DB (stream)...")
@@ -1307,12 +1313,12 @@ def build_excel_pair_large(
         only_a_cols = sorted(cols_a_set - cols_b_set)
         only_b_cols = sorted(cols_b_set - cols_a_set)
 
-        # ── Auto-detect chiave (su campione per non saturare RAM) ─────────────
+        # ── Auto-detect chiave (campione ridotto per velocità) ────────────────
         if join_key is None:
             if common:
                 sel_c = ", ".join(_q(c) for c in common)
-                smp_a = pd.read_sql(f"SELECT {sel_c} FROM asis  LIMIT 500000", conn)
-                smp_b = pd.read_sql(f"SELECT {sel_c} FROM tobe  LIMIT 500000", conn)
+                smp_a = pd.read_sql(f"SELECT {sel_c} FROM asis  LIMIT 100000", conn)
+                smp_b = pd.read_sql(f"SELECT {sel_c} FROM tobe  LIMIT 100000", conn)
                 join_key = detect_join_key(smp_a, smp_b)
                 del smp_a, smp_b
             else:
@@ -1322,13 +1328,17 @@ def build_excel_pair_large(
         value_cols = [c for c in common if c not in key_cols]
         _log(f"    Chiave: {', '.join(key_cols) if key_cols else '(nessuna — confronto posizionale)'}")
 
-        # ── Indici sulle chiavi ────────────────────────────────────────────────
+        # ── Indici + ANALYZE ─────────────────────────────────────────────────
         if key_cols:
             key_sql = ", ".join(_q(k) for k in key_cols)
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_asis ON asis ({key_sql})")
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_tobe ON tobe ({key_sql})")
             conn.commit()
-            _log("    Indici creati — avvio query di confronto...")
+            _log("    Indici creati — analisi statistica per query planner...")
+        conn.execute("ANALYZE asis")
+        conn.execute("ANALYZE tobe")
+        conn.execute("PRAGMA optimize")
+        _log("    Avvio query di confronto...")
 
         # ── Helper SQL ────────────────────────────────────────────────────────
         def kj(ta: str = "a", tb: str = "b") -> str:
@@ -1337,43 +1347,93 @@ def build_excel_pair_large(
                 for k in key_cols
             )
 
-        def dw(ta: str = "a", tb: str = "b") -> str:
-            if not value_cols:
-                return "1=0"
-            return " OR ".join(
-                f'COALESCE({ta}.{_q(c)},"") != COALESCE({tb}.{_q(c)},"")'
-                for c in value_cols
-            )
+        # ── SINTESI + n_both + n_only_a in passate LEFT JOIN da 30 col ────────
+        # LEFT JOIN IS NULL è molto più veloce di NOT EXISTS su tabelle grandi.
+        # Usiamo b.rowid IS NULL per distinguere "nessun match" da "key = NULL".
+        # La query è spezzata in batch da SINTESI_BATCH colonne per ridurre la
+        # complessità per passata e il consumo di memoria nel query engine.
+        _SINTESI_BATCH = 30
+        sint_rows: list[dict] = []
+        n_both   = 0
+        n_only_a = 0
+        n_only_b = 0
+        n_diff   = 0
 
-        # ── Contatori (un'unica passata) ──────────────────────────────────────
         if key_cols:
-            n_only_a = conn.execute(
-                f"SELECT COUNT(*) FROM asis a "
-                f"WHERE NOT EXISTS (SELECT 1 FROM tobe b WHERE {kj()})"
-            ).fetchone()[0]
+            val_batches = [value_cols[i:i + _SINTESI_BATCH]
+                           for i in range(0, max(len(value_cols), 1), _SINTESI_BATCH)]
+            if not val_batches:
+                val_batches = [[]]
+
+            for batch_idx, batch_cols in enumerate(val_batches):
+                pct = f"{batch_idx + 1}/{len(val_batches)}"
+                _log(f"    SINTESI batch {pct} ({len(batch_cols)} colonne)...")
+
+                cases = ", ".join(
+                    f"SUM(CASE WHEN b.rowid IS NOT NULL AND "
+                    f"COALESCE(a.{_q(c)},'') != COALESCE(b.{_q(c)},'') "
+                    f"THEN 1 ELSE 0 END) AS {_q('_d_' + c)}"
+                    for c in batch_cols
+                )
+
+                if batch_idx == 0:
+                    # Prima passata: calcola anche n_both e n_only_a
+                    extra = (
+                        "SUM(CASE WHEN b.rowid IS NOT NULL THEN 1 ELSE 0 END) AS _n_both, "
+                        "SUM(CASE WHEN b.rowid IS NULL     THEN 1 ELSE 0 END) AS _n_only_a"
+                    )
+                    select_clause = extra + (f", {cases}" if cases else "")
+                    row = conn.execute(
+                        f"SELECT {select_clause} FROM asis a LEFT JOIN tobe b ON {kj()}"
+                    ).fetchone()
+                    n_both   = row[0] or 0
+                    n_only_a = row[1] or 0
+                    col_offset = 2
+                else:
+                    if not cases:
+                        continue
+                    row = conn.execute(
+                        f"SELECT {cases} FROM asis a LEFT JOIN tobe b ON {kj()} "
+                        f"WHERE b.rowid IS NOT NULL"
+                    ).fetchone()
+                    col_offset = 0
+
+                for j, c in enumerate(batch_cols):
+                    nd = (row[col_offset + j] or 0) if row else 0
+                    sint_rows.append({
+                        "COLONNA": c, "CHIAVE": "No",
+                        "RIGHE UGUALI": n_both - nd, "RIGHE DIVERSE": nd,
+                        "TOT": n_both,
+                        "STATO": "OK" if nd == 0 else "DIFFERENZE",
+                    })
+
+            # ── n_only_b: reversed LEFT JOIN ──────────────────────────────────
+            _log("    Calcolo righe solo TO-BE...")
             n_only_b = conn.execute(
-                f"SELECT COUNT(*) FROM tobe b "
-                f"WHERE NOT EXISTS (SELECT 1 FROM asis a WHERE {kj('b','a')})"
+                f"SELECT COUNT(*) FROM tobe b LEFT JOIN asis a ON {kj('b','a')} "
+                f"WHERE a.rowid IS NULL"
             ).fetchone()[0]
-            n_diff = conn.execute(
-                f"SELECT COUNT(*) FROM asis a "
-                f"INNER JOIN tobe b ON {kj()} WHERE {dw()}"
-            ).fetchone()[0]
+
+            # ── n_diff: solo sulle colonne che hanno differenze (query mirata) ─
+            diff_cols = [sr["COLONNA"] for sr in sint_rows if sr["STATO"] == "DIFFERENZE"]
+            if diff_cols:
+                _log(f"    Calcolo righe con differenze ({len(diff_cols)} colonne)...")
+                # Usa al massimo 60 colonne per l'OR per limitare la complessità
+                diff_cond = " OR ".join(
+                    f"COALESCE(a.{_q(c)},'') != COALESCE(b.{_q(c)},'')"
+                    for c in diff_cols[:60]
+                )
+                n_diff = conn.execute(
+                    f"SELECT COUNT(*) FROM asis a "
+                    f"INNER JOIN tobe b ON {kj()} WHERE {diff_cond}"
+                ).fetchone()[0]
         else:
             n_only_a = max(0, n_a - n_b)
             n_only_b = max(0, n_b - n_a)
-            n_diff   = 0
 
         ok_overall = (n_only_a == 0 and n_only_b == 0 and n_diff == 0 and n_a == n_b)
 
-        # ── Controlla se il join ha prodotto match (chiave valida?) ──────────
-        n_both = 0
-        if key_cols:
-            n_both = conn.execute(
-                f"SELECT COUNT(*) FROM asis a INNER JOIN tobe b ON {kj()}"
-            ).fetchone()[0]
-
-        # Avviso chiave senza match: n_a e n_b > 0 ma il join ha reso 0 righe
+        # ── Avviso chiave senza match ─────────────────────────────────────────
         zero_match_warning = (
             key_cols and n_both == 0 and n_a > 0 and n_b > 0
         )
@@ -1381,28 +1441,6 @@ def build_excel_pair_large(
             _log("    [ATTENZIONE] La chiave di join non ha prodotto nessun match "
                  f"({', '.join(key_cols)}). Verificare che i valori chiave coincidano "
                  "tra AS-IS e TO-BE (case, spazi, prefissi £/#).")
-
-        # ── SINTESI differenze per colonna (una sola JOIN) ────────────────────
-        sint_rows: list[dict] = []
-        if key_cols and value_cols and n_both > 0:
-            cases = ", ".join(
-                f"SUM(CASE WHEN COALESCE(a.{_q(c)},'') != COALESCE(b.{_q(c)},'') "
-                f"THEN 1 ELSE 0 END) AS {_q('_d_' + c)}"
-                for c in value_cols[:300]
-            )
-            row = conn.execute(
-                f"SELECT COUNT(*) AS n_both, {cases} "
-                f"FROM asis a INNER JOIN tobe b ON {kj()}"
-            ).fetchone()
-            n_both = row[0]
-            for i, c in enumerate(value_cols[:300]):
-                nd = row[i + 1] or 0
-                sint_rows.append({
-                    "COLONNA": c, "CHIAVE": "No",
-                    "RIGHE UGUALI": n_both - nd, "RIGHE DIVERSE": nd,
-                    "TOT": n_both,
-                    "STATO": "OK" if nd == 0 else "DIFFERENZE",
-                })
 
         # ── Workbook ──────────────────────────────────────────────────────────
         wb  = openpyxl.Workbook()
