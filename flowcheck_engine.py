@@ -1331,9 +1331,25 @@ def build_excel_pair_large(
 
         ok_overall = (n_only_a == 0 and n_only_b == 0 and n_diff == 0 and n_a == n_b)
 
+        # ── Controlla se il join ha prodotto match (chiave valida?) ──────────
+        n_both = 0
+        if key_cols:
+            n_both = conn.execute(
+                f"SELECT COUNT(*) FROM asis a INNER JOIN tobe b ON {kj()}"
+            ).fetchone()[0]
+
+        # Avviso chiave senza match: n_a e n_b > 0 ma il join ha reso 0 righe
+        zero_match_warning = (
+            key_cols and n_both == 0 and n_a > 0 and n_b > 0
+        )
+        if zero_match_warning:
+            _log("    [ATTENZIONE] La chiave di join non ha prodotto nessun match "
+                 f"({', '.join(key_cols)}). Verificare che i valori chiave coincidano "
+                 "tra AS-IS e TO-BE (case, spazi, prefissi £/#).")
+
         # ── SINTESI differenze per colonna (una sola JOIN) ────────────────────
         sint_rows: list[dict] = []
-        if key_cols and value_cols:
+        if key_cols and value_cols and n_both > 0:
             cases = ", ".join(
                 f"SUM(CASE WHEN COALESCE(a.{_q(c)},'') != COALESCE(b.{_q(c)},'') "
                 f"THEN 1 ELSE 0 END) AS {_q('_d_' + c)}"
@@ -1377,8 +1393,21 @@ def build_excel_pair_large(
         ])
         _xl_data_row(ws_r, 3, _C_OK if ok_overall else _C_KO)
         ws_r.append([])
-        ws_r.append(["Chiave di join:", ", ".join(key_cols) if key_cols else "(nessuna)"])
+        ws_r.append(["Chiave di join:", ", ".join(key_cols) if key_cols else "(nessuna — confronto posizionale)"])
+        ws_r.append(["Righe con match (join):", n_both if key_cols else "n/a"])
         ws_r.append(["Modalità elaborazione:", "STREAM  (file grande — confronto via SQLite)"])
+        if zero_match_warning:
+            ws_r.append([])
+            warn_row = ["⚠  ATTENZIONE: la chiave di join non ha trovato nessun match tra AS-IS e TO-BE. "
+                        f"Chiave usata: {', '.join(key_cols)}. "
+                        "Possibili cause: valori con prefissi diversi (£/#), case sensitivity, "
+                        "separatore rilevato in modo errato. "
+                        "DIFF e SINTESI_COL non mostrano differenze perché il join ha reso 0 righe, "
+                        "non perché i file siano uguali."]
+            ws_r.append(warn_row)
+            warn_rn = ws_r.max_row
+            ws_r.cell(warn_rn, 1).fill = _xl_fill(_C_KO)
+            ws_r.cell(warn_rn, 1).font = Font(color=_CLR["err_fg"], bold=True)
         _xl_autofit(ws_r)
         ws_r.freeze_panes = "A3"
 
@@ -1417,6 +1446,13 @@ def build_excel_pair_large(
                                sr["RIGHE UGUALI"], sr["RIGHE DIVERSE"],
                                sr["TOT"], sr["STATO"]])
                 _xl_data_row(ws_sc, ws_sc.max_row, bg)
+        elif zero_match_warning:
+            msg = ("⚠  Statistiche non disponibili: la chiave di join "
+                   f"({', '.join(key_cols)}) non ha trovato nessun match. "
+                   "I contatori sarebbero tutti zero — non indicano file uguali.")
+            ws_sc.append([msg])
+            ws_sc.cell(ws_sc.max_row, 1).fill = _xl_fill(_C_KO)
+            ws_sc.cell(ws_sc.max_row, 1).font = Font(color=_CLR["err_fg"], bold=True)
         else:
             ws_sc.append(["(dati non disponibili senza chiave di join)"])
         _xl_autofit(ws_sc)
@@ -1461,8 +1497,21 @@ def build_excel_pair_large(
                 ws_d.freeze_panes = f"{get_column_letter(len(key_cols)+1)}3"
         else:
             _xl_title(ws_d, f"Differenze  —  {label}", 1)
-            ws_d.append(["(nessuna differenza rilevata)" if n_diff == 0 else
-                          "(confronto non disponibile senza chiave di join)"])
+            if zero_match_warning:
+                msg = ("⚠  Impossibile mostrare differenze: la chiave di join "
+                       f"({', '.join(key_cols)}) non ha prodotto nessun match tra AS-IS e TO-BE. "
+                       "Verificare la chiave o controllare prefissi £/# nei valori. "
+                       "Tutte le righe AS-IS sono in SOLO_ASIS e tutte le TO-BE in SOLO_TOBE.")
+            elif n_diff == 0 and key_cols:
+                msg = "(nessuna differenza rilevata — tutti i match concordano)"
+            elif n_diff == 0:
+                msg = "(confronto non disponibile senza chiave di join)"
+            else:
+                msg = "(confronto non disponibile senza chiave di join)"
+            ws_d.append([msg])
+            if zero_match_warning:
+                ws_d.cell(ws_d.max_row, 1).fill = _xl_fill(_C_KO)
+                ws_d.cell(ws_d.max_row, 1).font = Font(color=_CLR["err_fg"], bold=True)
 
         # 5. SOLO_ASIS
         ws_a = wb.create_sheet("SOLO_ASIS")
