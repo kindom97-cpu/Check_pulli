@@ -1182,60 +1182,48 @@ def _iter_csv_chunks(
                 pass
 
 
-def _sqlite_executemany_insert(table, conn, keys, data_iter):
-    """
-    Metodo di insert per pandas to_sql che usa executemany con placeholder ?
-    (stile SQLite nativo). Evita completamente il limite 'too many SQL variables'
-    che colpisce method='multi' quando cols > ~15 oppure rows×cols > 999.
-    Lo statement viene preparato una sola volta e riutilizzato per tutte le righe:
-    prestazioni buone anche su file con 100+ colonne.
-    """
-    data = list(data_iter)
-    if not data:
-        return
-    placeholders = ", ".join(["?"] * len(keys))
-    quoted_cols  = ", ".join(f'"{k}"' for k in keys)
-    stmt = f'INSERT INTO "{table.name}" ({quoted_cols}) VALUES ({placeholders})'
-    conn.executemany(stmt, data)
-
-
-def _load_to_sqlite(
+def _load_to_duckdb(
     path_str: str,
     sep: str,
-    conn: "object",         # sqlite3.Connection — importato inline
+    db_path: str,
     table: str,
-    chunk_size: int = 50_000,
+    chunk_size: int = 100_000,
     log_cb: Callable[[str], None] | None = None,
     row_filter: "dict[str, str] | None" = None,
 ) -> tuple[list[str], int]:
     """
-    Carica un CSV (o ZIP entry) in una tabella SQLite a blocchi.
+    Carica un CSV (o ZIP entry) in una tabella DuckDB su file, a blocchi.
+    Ogni chiamata usa una connessione DuckDB dedicata (thread-safe).
+    Aggiunge la colonna sentinella _fc_exists=1 per rilevare LEFT JOIN miss.
     Restituisce (nomi_colonne_normalizzati, n_righe_totali).
     """
-    total: int      = 0
+    import duckdb as _duckdb
+    conn   = _duckdb.connect(db_path)
+    total  = 0
     col_names: list[str] = []
+    first  = True
 
-    for i, (cols, chunk) in enumerate(_iter_csv_chunks(path_str, sep, chunk_size)):
-        if not col_names:
-            col_names = cols
-        # Apply row filter per chunk
-        if row_filter:
-            for _fc, _fv in row_filter.items():
-                if _fc in chunk.columns:
-                    chunk = chunk[chunk[_fc].str.strip() == _fv.strip()]
-            if chunk.empty:
-                continue  # skip empty chunks after filtering
-        # Usa executemany nativo SQLite: nessun limite su variabili,
-        # statement preparato una volta sola → performante su file 100+ colonne.
-        chunk.to_sql(
-            table, conn,
-            if_exists="append" if i > 0 else "replace",
-            index=False,
-            method=_sqlite_executemany_insert,
-        )
-        total += len(chunk)
-        if log_cb and (total % (chunk_size * 4) < chunk_size):
-            log_cb(f"    {table.upper()}: {total:,} righe caricate...")
+    try:
+        for cols, chunk in _iter_csv_chunks(path_str, sep, chunk_size):
+            if not col_names:
+                col_names = cols
+            if row_filter:
+                for _fc, _fv in row_filter.items():
+                    if _fc in chunk.columns:
+                        chunk = chunk[chunk[_fc].str.strip() == _fv.strip()]
+                if chunk.empty:
+                    continue
+            chunk["_fc_exists"] = 1   # sentinella per LEFT JOIN IS NULL
+            if first:
+                conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM chunk')
+                first = False
+            else:
+                conn.execute(f'INSERT INTO "{table}" SELECT * FROM chunk')
+            total += len(chunk)
+            if log_cb and total % (chunk_size * 4) < chunk_size:
+                log_cb(f"    {table.upper()}: {total:,} righe caricate...")
+    finally:
+        conn.close()
 
     if log_cb:
         log_cb(f"    {table.upper()}: completato — {total:,} righe, {len(col_names)} colonne")
@@ -1259,23 +1247,19 @@ def build_excel_pair_large(
     join_key: "list[str] | None" = None,
     max_diff_rows: int = 10_000,
     max_only_rows: int = 5_000,
-    chunk_size: int = 50_000,
+    chunk_size: int = 100_000,
     log_cb: "Callable[[str], None] | None" = None,
     row_filter: "dict[str, str] | None" = None,
 ) -> str:
     """
-    Confronta due grandi CSV via SQLite senza caricarli interamente in RAM.
+    Confronta due grandi CSV via DuckDB (OLAP, colonnare, multithreaded).
+    Carica AS-IS e TO-BE in PARALLELO in due file DuckDB separati,
+    poi esegue le query analitiche con hash join vettorizzato.
     Produce il medesimo Excel a 6 fogli di build_excel_pair.
-
-    Flusso:
-      1. Legge AS-IS a chunk → SQLite 'asis'
-      2. Legge TO-BE a chunk → SQLite 'tobe'
-      3. Crea indici sulle chiavi di join
-      4. Esegue query SQL per: contatori, DIFF, SOLO_ASIS, SOLO_TOBE, SINTESI
-      5. Scrive l'Excel e cancella il DB temporaneo
     """
-    import sqlite3 as _sqlite3
+    import duckdb as _duckdb
     import tempfile as _tempfile
+    import threading as _threading
 
     def _log(msg: str):
         if log_cb:
@@ -1283,148 +1267,130 @@ def build_excel_pair_large(
 
     output_path = Path(output_path)
 
-    # ── DB temporaneo su disco ─────────────────────────────────────────────────
-    db_fd, db_path = _tempfile.mkstemp(suffix=".db", prefix="flowcheck_tmp_")
-    os.close(db_fd)
-    _log(f"    DB temporaneo: {db_path}")
+    # ── File DuckDB temporanei (uno per lato, per caricamento parallelo) ───────
+    _, db_path_a = _tempfile.mkstemp(suffix=".duckdb", prefix="flowcheck_a_")
+    _, db_path_b = _tempfile.mkstemp(suffix=".duckdb", prefix="flowcheck_b_")
+    # DuckDB crea i propri file — eliminiamo i placeholder creati da mkstemp
+    os.unlink(db_path_a)
+    os.unlink(db_path_b)
+
+    load_results: dict = {}
+    load_errors:  dict = {}
+
+    def _load_side(side: str, path: str, sep: str, db_path: str, table: str, label_str: str):
+        try:
+            cols, n = _load_to_duckdb(path, sep, db_path, table, chunk_size, _log, row_filter)
+            load_results[side] = (cols, n)
+        except Exception as exc:
+            load_errors[side] = exc
+
+    # ── Caricamento PARALLELO ─────────────────────────────────────────────────
+    _log("    Caricamento AS-IS e TO-BE in parallelo (DuckDB)...")
+    t_a = _threading.Thread(target=_load_side,
+                            args=("a", path_a, sep_a, db_path_a, "asis", "AS-IS"))
+    t_b = _threading.Thread(target=_load_side,
+                            args=("b", path_b, sep_b, db_path_b, "tobe", "TO-BE"))
+    t_a.start(); t_b.start()
+    t_a.join();  t_b.join()
+
+    if load_errors:
+        raise RuntimeError(f"Errore caricamento: {load_errors}")
+
+    cols_a, n_a = load_results["a"]
+    cols_b, n_b = load_results["b"]
 
     try:
-        conn = _sqlite3.connect(db_path)
-        # ── PRAGMA per performance su DB temporanei di grandi dimensioni ──────
-        # page_size va impostato PRIMA di qualsiasi INSERT (nuovo DB vuoto)
-        conn.execute("PRAGMA page_size=65536")        # 64 KB/pagina → meno I/O sequenziale
-        conn.execute("PRAGMA journal_mode=MEMORY")    # journal in RAM, no file di rollback
-        conn.execute("PRAGMA synchronous=OFF")        # DB temporaneo: no crash recovery
-        conn.execute("PRAGMA cache_size=-2097152")    # 2 GB di cache SQLite
-        conn.execute("PRAGMA temp_store=MEMORY")      # tabelle temp in RAM
-        conn.execute("PRAGMA mmap_size=8589934592")   # 8 GB memory-mapped I/O
-        conn.execute("PRAGMA locking_mode=EXCLUSIVE") # nessun overhead di lock multi-processo
+        # ── Connessione principale: ATTACH di entrambi i DB ───────────────────
+        conn = _duckdb.connect()
+        conn.execute(f"ATTACH '{db_path_a}' AS dba (READ_ONLY)")
+        conn.execute(f"ATTACH '{db_path_b}' AS dbb (READ_ONLY)")
+        conn.execute("CREATE VIEW asis AS SELECT * FROM dba.asis")
+        conn.execute("CREATE VIEW tobe AS SELECT * FROM dbb.tobe")
 
-        # ── Caricamento ──────────────────────────────────────────────────────
-        _log("    Caricamento AS-IS → DB (stream)...")
-        cols_a, n_a = _load_to_sqlite(path_a, sep_a, conn, "asis", chunk_size, _log, row_filter=row_filter)
-
-        _log("    Caricamento TO-BE → DB (stream)...")
-        cols_b, n_b = _load_to_sqlite(path_b, sep_b, conn, "tobe", chunk_size, _log, row_filter=row_filter)
-
-        cols_a_set = set(cols_a)
-        cols_b_set = set(cols_b)
-        common     = [c for c in cols_a if c in cols_b_set]
+        cols_a_set  = set(cols_a)
+        cols_b_set  = set(cols_b)
+        common      = [c for c in cols_a if c in cols_b_set]
         only_a_cols = sorted(cols_a_set - cols_b_set)
         only_b_cols = sorted(cols_b_set - cols_a_set)
 
-        # ── Auto-detect chiave (campione ridotto per velocità) ────────────────
+        # Colonne utente (escludi sentinella interna)
+        user_cols_a = [c for c in cols_a if c != "_fc_exists"]
+        user_cols_b = [c for c in cols_b if c != "_fc_exists"]
+        common_user = [c for c in user_cols_a if c in set(user_cols_b)]
+
+        # ── Auto-detect chiave su campione ────────────────────────────────────
         if join_key is None:
-            if common:
-                sel_c = ", ".join(_q(c) for c in common)
-                smp_a = pd.read_sql(f"SELECT {sel_c} FROM asis  LIMIT 100000", conn)
-                smp_b = pd.read_sql(f"SELECT {sel_c} FROM tobe  LIMIT 100000", conn)
+            if common_user:
+                sel_c = ", ".join(_q(c) for c in common_user)
+                smp_a = conn.execute(f"SELECT {sel_c} FROM asis LIMIT 100000").df()
+                smp_b = conn.execute(f"SELECT {sel_c} FROM tobe LIMIT 100000").df()
                 join_key = detect_join_key(smp_a, smp_b)
                 del smp_a, smp_b
             else:
                 join_key = []
 
         key_cols   = join_key or []
-        value_cols = [c for c in common if c not in key_cols]
+        value_cols = [c for c in common_user if c not in key_cols]
         _log(f"    Chiave: {', '.join(key_cols) if key_cols else '(nessuna — confronto posizionale)'}")
+        _log("    Avvio query DuckDB (hash join vettorizzato)...")
 
-        # ── Indici + ANALYZE ─────────────────────────────────────────────────
-        if key_cols:
-            key_sql = ", ".join(_q(k) for k in key_cols)
-            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_asis ON asis ({key_sql})")
-            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_tobe ON tobe ({key_sql})")
-            conn.commit()
-            _log("    Indici creati — analisi statistica per query planner...")
-        conn.execute("ANALYZE asis")
-        conn.execute("ANALYZE tobe")
-        conn.execute("PRAGMA optimize")
-        _log("    Avvio query di confronto...")
-
-        # ── Helper SQL ────────────────────────────────────────────────────────
+        # ── Helper SQL (DuckDB: COALESCE ok, hash join non usa indici) ────────
         def kj(ta: str = "a", tb: str = "b") -> str:
             return " AND ".join(
-                f'COALESCE({ta}.{_q(k)},"") = COALESCE({tb}.{_q(k)},"")'
+                f"COALESCE({ta}.{_q(k)},'') = COALESCE({tb}.{_q(k)},'')"
                 for k in key_cols
             )
 
-        # ── SINTESI + n_both + n_only_a in passate LEFT JOIN da 30 col ────────
-        # LEFT JOIN IS NULL è molto più veloce di NOT EXISTS su tabelle grandi.
-        # Usiamo b.rowid IS NULL per distinguere "nessun match" da "key = NULL".
-        # La query è spezzata in batch da SINTESI_BATCH colonne per ridurre la
-        # complessità per passata e il consumo di memoria nel query engine.
-        _SINTESI_BATCH = 30
         sint_rows: list[dict] = []
-        n_both   = 0
-        n_only_a = 0
-        n_only_b = 0
-        n_diff   = 0
+        n_both = n_only_a = n_only_b = n_diff = 0
 
         if key_cols:
-            val_batches = [value_cols[i:i + _SINTESI_BATCH]
-                           for i in range(0, max(len(value_cols), 1), _SINTESI_BATCH)]
-            if not val_batches:
-                val_batches = [[]]
+            # ── SINTESI completa in UNA SOLA query DuckDB ─────────────────────
+            # DuckDB: vectorized, columnar, multithreaded → milliseconds su <10M righe
+            # COUNT(*) FILTER è sintassi DuckDB nativa (non disponibile in SQLite)
+            cases = ",\n    ".join(
+                f"SUM(CASE WHEN b._fc_exists IS NOT NULL AND "
+                f"COALESCE(a.{_q(c)},'') != COALESCE(b.{_q(c)},'') "
+                f"THEN 1 ELSE 0 END) AS {_q('_d_' + c)}"
+                for c in value_cols
+            )
+            select_clause = (
+                "COUNT(*) FILTER (WHERE b._fc_exists IS NOT NULL) AS _n_both,\n"
+                "    COUNT(*) FILTER (WHERE b._fc_exists IS NULL)     AS _n_only_a"
+                + (f",\n    {cases}" if cases else "")
+            )
+            _log("    SINTESI (query unica su tutte le colonne)...")
+            row = conn.execute(
+                f"SELECT {select_clause}\n"
+                f"FROM asis a LEFT JOIN tobe b ON {kj()}"
+            ).fetchone()
+            n_both   = row[0] or 0
+            n_only_a = row[1] or 0
+            for j, c in enumerate(value_cols):
+                nd = row[2 + j] or 0
+                sint_rows.append({
+                    "COLONNA": c, "CHIAVE": "No",
+                    "RIGHE UGUALI": n_both - nd, "RIGHE DIVERSE": nd,
+                    "TOT": n_both,
+                    "STATO": "OK" if nd == 0 else "DIFFERENZE",
+                })
 
-            for batch_idx, batch_cols in enumerate(val_batches):
-                pct = f"{batch_idx + 1}/{len(val_batches)}"
-                _log(f"    SINTESI batch {pct} ({len(batch_cols)} colonne)...")
-
-                cases = ", ".join(
-                    f"SUM(CASE WHEN b.rowid IS NOT NULL AND "
-                    f"COALESCE(a.{_q(c)},'') != COALESCE(b.{_q(c)},'') "
-                    f"THEN 1 ELSE 0 END) AS {_q('_d_' + c)}"
-                    for c in batch_cols
-                )
-
-                if batch_idx == 0:
-                    # Prima passata: calcola anche n_both e n_only_a
-                    extra = (
-                        "SUM(CASE WHEN b.rowid IS NOT NULL THEN 1 ELSE 0 END) AS _n_both, "
-                        "SUM(CASE WHEN b.rowid IS NULL     THEN 1 ELSE 0 END) AS _n_only_a"
-                    )
-                    select_clause = extra + (f", {cases}" if cases else "")
-                    row = conn.execute(
-                        f"SELECT {select_clause} FROM asis a LEFT JOIN tobe b ON {kj()}"
-                    ).fetchone()
-                    n_both   = row[0] or 0
-                    n_only_a = row[1] or 0
-                    col_offset = 2
-                else:
-                    if not cases:
-                        continue
-                    row = conn.execute(
-                        f"SELECT {cases} FROM asis a LEFT JOIN tobe b ON {kj()} "
-                        f"WHERE b.rowid IS NOT NULL"
-                    ).fetchone()
-                    col_offset = 0
-
-                for j, c in enumerate(batch_cols):
-                    nd = (row[col_offset + j] or 0) if row else 0
-                    sint_rows.append({
-                        "COLONNA": c, "CHIAVE": "No",
-                        "RIGHE UGUALI": n_both - nd, "RIGHE DIVERSE": nd,
-                        "TOT": n_both,
-                        "STATO": "OK" if nd == 0 else "DIFFERENZE",
-                    })
-
-            # ── n_only_b: reversed LEFT JOIN ──────────────────────────────────
+            # ── n_only_b ─────────────────────────────────────────────────────
             _log("    Calcolo righe solo TO-BE...")
             n_only_b = conn.execute(
-                f"SELECT COUNT(*) FROM tobe b LEFT JOIN asis a ON {kj('b','a')} "
-                f"WHERE a.rowid IS NULL"
+                f"SELECT COUNT(*) FILTER (WHERE a._fc_exists IS NULL)\n"
+                f"FROM tobe b LEFT JOIN asis a ON {kj('b', 'a')}"
             ).fetchone()[0]
 
-            # ── n_diff: solo sulle colonne che hanno differenze (query mirata) ─
+            # ── n_diff: sulle sole colonne con differenze ─────────────────────
             diff_cols = [sr["COLONNA"] for sr in sint_rows if sr["STATO"] == "DIFFERENZE"]
             if diff_cols:
-                _log(f"    Calcolo righe con differenze ({len(diff_cols)} colonne)...")
-                # Usa al massimo 60 colonne per l'OR per limitare la complessità
                 diff_cond = " OR ".join(
                     f"COALESCE(a.{_q(c)},'') != COALESCE(b.{_q(c)},'')"
                     for c in diff_cols[:60]
                 )
                 n_diff = conn.execute(
-                    f"SELECT COUNT(*) FROM asis a "
+                    f"SELECT COUNT(*) FROM asis a\n"
                     f"INNER JOIN tobe b ON {kj()} WHERE {diff_cond}"
                 ).fetchone()[0]
         else:
@@ -1433,10 +1399,7 @@ def build_excel_pair_large(
 
         ok_overall = (n_only_a == 0 and n_only_b == 0 and n_diff == 0 and n_a == n_b)
 
-        # ── Avviso chiave senza match ─────────────────────────────────────────
-        zero_match_warning = (
-            key_cols and n_both == 0 and n_a > 0 and n_b > 0
-        )
+        zero_match_warning = (key_cols and n_both == 0 and n_a > 0 and n_b > 0)
         if zero_match_warning:
             _log("    [ATTENZIONE] La chiave di join non ha prodotto nessun match "
                  f"({', '.join(key_cols)}). Verificare che i valori chiave coincidano "
@@ -1468,18 +1431,16 @@ def build_excel_pair_large(
         ws_r.append([])
         ws_r.append(["Chiave di join:", ", ".join(key_cols) if key_cols else "(nessuna — confronto posizionale)"])
         ws_r.append(["Righe con match (join):", n_both if key_cols else "n/a"])
-        ws_r.append(["Modalità elaborazione:", "STREAM  (file grande — confronto via SQLite)"])
+        ws_r.append(["Modalità elaborazione:", "STREAM  (file grande — confronto via DuckDB)"])
         if row_filter:
             _filter_desc = "  AND  ".join(f"{k} = '{v}'" for k, v in row_filter.items())
             ws_r.append(["Filtro righe applicato:", _filter_desc])
         if zero_match_warning:
             ws_r.append([])
-            warn_row = ["⚠  ATTENZIONE: la chiave di join non ha trovato nessun match tra AS-IS e TO-BE. "
+            warn_row = ["ATTENZIONE: la chiave di join non ha trovato nessun match tra AS-IS e TO-BE. "
                         f"Chiave usata: {', '.join(key_cols)}. "
-                        "Possibili cause: valori con prefissi diversi (£/#), case sensitivity, "
-                        "separatore rilevato in modo errato. "
-                        "DIFF e SINTESI_COL non mostrano differenze perché il join ha reso 0 righe, "
-                        "non perché i file siano uguali."]
+                        "Possibili cause: valori con prefissi diversi, case sensitivity, "
+                        "separatore rilevato in modo errato."]
             ws_r.append(warn_row)
             warn_rn = ws_r.max_row
             ws_r.cell(warn_rn, 1).fill = _xl_fill(_C_KO)
@@ -1490,42 +1451,39 @@ def build_excel_pair_large(
         # 2. STRUTTURA
         ws_s = wb.create_sheet("STRUTTURA")
         _xl_title(ws_s, f"Struttura colonne  —  {label}", 6)
-        ws_s.append(["COLONNA", "IN AS-IS", "IN TO-BE",
-                     "POS AS-IS", "POS TO-BE", "STATUS"])
+        ws_s.append(["COLONNA", "IN AS-IS", "IN TO-BE", "POS AS-IS", "POS TO-BE", "STATUS"])
         _xl_hdr_row(ws_s, 2)
-        all_cols = cols_a + [c for c in cols_b if c not in cols_a_set]
+        all_cols = user_cols_a + [c for c in user_cols_b if c not in set(user_cols_a)]
         for c in all_cols:
-            ia, ib = c in cols_a_set, c in cols_b_set
+            ia = c in set(user_cols_a)
+            ib = c in set(user_cols_b)
             st = "OK" if (ia and ib) else ("SOLO AS-IS" if ia else "SOLO TO-BE")
             ws_s.append([c,
-                         "Sì" if ia else "No", "Sì" if ib else "No",
-                         cols_a.index(c) + 1 if ia else "—",
-                         cols_b.index(c) + 1 if ib else "—",
+                         "Si" if ia else "No", "Si" if ib else "No",
+                         user_cols_a.index(c) + 1 if ia else "—",
+                         user_cols_b.index(c) + 1 if ib else "—",
                          st])
             rn = ws_s.max_row
-            if   st == "SOLO AS-IS":  _xl_data_row(ws_s, rn, _C_ONLY_AS)
-            elif st == "SOLO TO-BE":  _xl_data_row(ws_s, rn, _C_ONLY_TO)
-            else:                     _xl_data_row(ws_s, rn)
+            if   st == "SOLO AS-IS": _xl_data_row(ws_s, rn, _C_ONLY_AS)
+            elif st == "SOLO TO-BE": _xl_data_row(ws_s, rn, _C_ONLY_TO)
+            else:                    _xl_data_row(ws_s, rn)
         _xl_autofit(ws_s)
         ws_s.freeze_panes = "A3"
 
         # 3. SINTESI_COL
         ws_sc = wb.create_sheet("SINTESI_COL")
         _xl_title(ws_sc, f"Sintesi differenze per colonna  —  {label}", 6)
-        ws_sc.append(["COLONNA", "CHIAVE", "RIGHE UGUALI", "RIGHE DIVERSE",
-                      "TOT RIGHE", "STATO"])
+        ws_sc.append(["COLONNA", "CHIAVE", "RIGHE UGUALI", "RIGHE DIVERSE", "TOT RIGHE", "STATO"])
         _xl_hdr_row(ws_sc, 2)
         if sint_rows:
             for sr in sint_rows:
                 bg = _C_OK if sr["STATO"] == "OK" else _C_KO
                 ws_sc.append([sr["COLONNA"], sr["CHIAVE"],
-                               sr["RIGHE UGUALI"], sr["RIGHE DIVERSE"],
-                               sr["TOT"], sr["STATO"]])
+                               sr["RIGHE UGUALI"], sr["RIGHE DIVERSE"], sr["TOT"], sr["STATO"]])
                 _xl_data_row(ws_sc, ws_sc.max_row, bg)
         elif zero_match_warning:
-            msg = ("⚠  Statistiche non disponibili: la chiave di join "
-                   f"({', '.join(key_cols)}) non ha trovato nessun match. "
-                   "I contatori sarebbero tutti zero — non indicano file uguali.")
+            msg = (f"Statistiche non disponibili: chiave ({', '.join(key_cols)}) "
+                   "non ha trovato nessun match.")
             ws_sc.append([msg])
             ws_sc.cell(ws_sc.max_row, 1).fill = _xl_fill(_C_KO)
             ws_sc.cell(ws_sc.max_row, 1).font = Font(color=_CLR["err_fg"], bold=True)
@@ -1537,15 +1495,18 @@ def build_excel_pair_large(
         # 4. DIFF
         ws_d = wb.create_sheet("DIFF")
         if key_cols and value_cols and n_diff > 0:
-            sel_k  = ", ".join(f"a.{_q(k)}" for k in key_cols)
-            sel_av = ", ".join(f'a.{_q(c)} AS {_q(c + "__AS")}' for c in value_cols)
-            sel_bv = ", ".join(f'b.{_q(c)} AS {_q(c + "__TO")}' for c in value_cols)
-            diff_df = pd.read_sql(
-                f"SELECT {sel_k}, {sel_av}, {sel_bv} "
-                f"FROM asis a INNER JOIN tobe b ON {kj()} "
-                f"WHERE {dw()} LIMIT {max_diff_rows}",
-                conn,
+            diff_cond = " OR ".join(
+                f"COALESCE(a.{_q(c)},'') != COALESCE(b.{_q(c)},'')"
+                for c in (diff_cols if diff_cols else value_cols)[:60]
             )
+            sel_k  = ", ".join(f"a.{_q(k)}" for k in key_cols)
+            sel_av = ", ".join(f"a.{_q(c)} AS {_q(c + '__AS')}" for c in value_cols)
+            sel_bv = ", ".join(f"b.{_q(c)} AS {_q(c + '__TO')}" for c in value_cols)
+            diff_df = conn.execute(
+                f"SELECT {sel_k}, {sel_av}, {sel_bv}\n"
+                f"FROM asis a INNER JOIN tobe b ON {kj()}\n"
+                f"WHERE {diff_cond}\nLIMIT {max_diff_rows}"
+            ).df()
             note = (f" — prime {max_diff_rows:,} su {n_diff:,}" if n_diff > max_diff_rows
                     else f" — {n_diff:,} righe con diff")
             hdr_d = list(key_cols)
@@ -1554,17 +1515,18 @@ def build_excel_pair_large(
             _xl_title(ws_d, f"Differenze  —  {label}{note}", len(hdr_d))
             ws_d.append(hdr_d)
             _xl_hdr_row(ws_d, 2)
-            for i, (_, row) in enumerate(key_cols and diff_df.iterrows() or []):
+            for _, row in diff_df.iterrows():
                 rv = [row.get(k, "") for k in key_cols]
                 for c in value_cols:
-                    va, vb = row.get(f"{c}__AS", ""), row.get(f"{c}__TO", "")
+                    va = row.get(f"{c}__AS", "")
+                    vb = row.get(f"{c}__TO", "")
                     rv += [va, vb, _num_diff(va, vb)]
                 ws_d.append(rv)
                 rn = ws_d.max_row
                 _xl_data_row(ws_d, rn)
                 off = len(key_cols) + 1
                 for c in value_cols:
-                    if str(row.get(f"{c}__AS","")).strip() != str(row.get(f"{c}__TO","")).strip():
+                    if str(row.get(f"{c}__AS", "")).strip() != str(row.get(f"{c}__TO", "")).strip():
                         ws_d.cell(rn, off).fill     = _xl_fill(_C_DIFF)
                         ws_d.cell(rn, off + 1).fill = _xl_fill(_C_DIFF)
                     off += 3
@@ -1574,14 +1536,10 @@ def build_excel_pair_large(
         else:
             _xl_title(ws_d, f"Differenze  —  {label}", 1)
             if zero_match_warning:
-                msg = ("⚠  Impossibile mostrare differenze: la chiave di join "
-                       f"({', '.join(key_cols)}) non ha prodotto nessun match tra AS-IS e TO-BE. "
-                       "Verificare la chiave o controllare prefissi £/# nei valori. "
-                       "Tutte le righe AS-IS sono in SOLO_ASIS e tutte le TO-BE in SOLO_TOBE.")
+                msg = ("Impossibile mostrare differenze: chiave di join senza match. "
+                       "Verificare prefissi o separatore.")
             elif n_diff == 0 and key_cols:
                 msg = "(nessuna differenza rilevata — tutti i match concordano)"
-            elif n_diff == 0:
-                msg = "(confronto non disponibile senza chiave di join)"
             else:
                 msg = "(confronto non disponibile senza chiave di join)"
             ws_d.append([msg])
@@ -1592,14 +1550,17 @@ def build_excel_pair_large(
         # 5. SOLO_ASIS
         ws_a = wb.create_sheet("SOLO_ASIS")
         if key_cols:
-            sel = ", ".join(f"a.{_q(c)}" for c in cols_a)
-            q_a = (f"SELECT {sel} FROM asis a "
-                   f"WHERE NOT EXISTS (SELECT 1 FROM tobe b WHERE {kj()}) "
-                   f"LIMIT {max_only_rows}")
+            sel = ", ".join(f"a.{_q(c)}" for c in user_cols_a)
+            only_a_df = conn.execute(
+                f"SELECT {sel} FROM asis a\n"
+                f"LEFT JOIN tobe b ON {kj()}\n"
+                f"WHERE b._fc_exists IS NULL LIMIT {max_only_rows}"
+            ).df()
         else:
-            q_a = f"SELECT * FROM asis LIMIT {max_only_rows}"
-        only_a_df = pd.read_sql(q_a, conn)
-        trunc_a   = n_only_a > max_only_rows
+            only_a_df = conn.execute(
+                f"SELECT {', '.join(_q(c) for c in user_cols_a)} FROM asis LIMIT {max_only_rows}"
+            ).df()
+        trunc_a = n_only_a > max_only_rows
         ttl_a = (f"Solo in AS-IS  —  {label}"
                  + (f"  (prime {max_only_rows:,} su {n_only_a:,})" if trunc_a else ""))
         _xl_title(ws_a, ttl_a, max(len(only_a_df.columns), 1))
@@ -1616,14 +1577,17 @@ def build_excel_pair_large(
         # 6. SOLO_TOBE
         ws_t = wb.create_sheet("SOLO_TOBE")
         if key_cols:
-            sel = ", ".join(f"b.{_q(c)}" for c in cols_b)
-            q_b = (f"SELECT {sel} FROM tobe b "
-                   f"WHERE NOT EXISTS (SELECT 1 FROM asis a WHERE {kj('b','a')}) "
-                   f"LIMIT {max_only_rows}")
+            sel = ", ".join(f"b.{_q(c)}" for c in user_cols_b)
+            only_b_df = conn.execute(
+                f"SELECT {sel} FROM tobe b\n"
+                f"LEFT JOIN asis a ON {kj('b', 'a')}\n"
+                f"WHERE a._fc_exists IS NULL LIMIT {max_only_rows}"
+            ).df()
         else:
-            q_b = f"SELECT * FROM tobe LIMIT {max_only_rows}"
-        only_b_df = pd.read_sql(q_b, conn)
-        trunc_b   = n_only_b > max_only_rows
+            only_b_df = conn.execute(
+                f"SELECT {', '.join(_q(c) for c in user_cols_b)} FROM tobe LIMIT {max_only_rows}"
+            ).df()
+        trunc_b = n_only_b > max_only_rows
         ttl_b = (f"Solo in TO-BE  —  {label}"
                  + (f"  (prime {max_only_rows:,} su {n_only_b:,})" if trunc_b else ""))
         _xl_title(ws_t, ttl_b, max(len(only_b_df.columns), 1))
@@ -1642,15 +1606,12 @@ def build_excel_pair_large(
         return str(output_path)
 
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        try:
-            os.unlink(db_path)
-            _log("    DB temporaneo rimosso.")
-        except Exception:
-            pass
+        for p in (db_path_a, db_path_b):
+            for ext in ("", ".wal"):
+                try:
+                    os.unlink(p + ext)
+                except Exception:
+                    pass
 
 
 def _get_raw_content(path_str: str, zip_entry: str | None = None) -> str:
