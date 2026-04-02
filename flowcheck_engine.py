@@ -1208,12 +1208,17 @@ def _load_to_sqlite(
                     chunk = chunk[chunk[_fc].str.strip() == _fv.strip()]
             if chunk.empty:
                 continue  # skip empty chunks after filtering
+        # SQLite limita a 999 variabili per statement.
+        # Con method='multi' ogni batch inserisce rows × cols variabili,
+        # quindi calcoliamo il massimo numero di righe per batch in modo dinamico.
+        _SQLITE_MAX_VARS = 999
+        _sql_batch = max(1, _SQLITE_MAX_VARS // max(len(chunk.columns), 1))
         chunk.to_sql(
             table, conn,
             if_exists="append" if i > 0 else "replace",
             index=False,
             method="multi",
-            chunksize=2_000,
+            chunksize=_sql_batch,
         )
         total += len(chunk)
         if log_cb and (total % (chunk_size * 4) < chunk_size):
