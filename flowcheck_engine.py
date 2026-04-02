@@ -2155,14 +2155,27 @@ def run_comparison(
                 )
                 generated.append(generated_path)
 
-                # Issue log minimale (senza df in memoria)
+                # Issue log per modalità streaming (campi richiesti con valori default)
                 issue_records.append({
-                    "label":      label,
-                    "asis_label": pair["asis_label"],
-                    "tobe_label": pair["tobe_label"],
-                    "sep_a":      sep_a,
-                    "sep_b":      sep_b,
-                    "note":       f"Elaborazione streaming ({mb:.0f} MB)",
+                    "label":           label,
+                    "asis_label":      pair["asis_label"],
+                    "tobe_label":      pair["tobe_label"],
+                    "sep_a":           sep_a,
+                    "sep_b":           sep_b,
+                    "sep_ok":          sep_a == sep_b,
+                    "n_a":             0,
+                    "n_b":             0,
+                    "cols_only_a":     [],
+                    "cols_only_b":     [],
+                    "type_mismatches": [],
+                    "n_diff_rows":     0,
+                    "n_only_a":        0,
+                    "n_only_b":        0,
+                    "bad_lines_a":     [],
+                    "bad_lines_b":     [],
+                    "n_ws_a":          0,
+                    "n_ws_b":          0,
+                    "note":            f"Streaming DuckDB ({mb:.0f} MB) — dettagli nel file Excel",
                 })
 
                 _log(f"  [OK] Excel salvato: {out_name}")
