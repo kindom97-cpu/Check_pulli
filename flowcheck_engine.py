@@ -869,6 +869,7 @@ def build_excel_pair(
     max_diff_rows: int = 10_000,
     max_only_rows: int = 5_000,
     log_path: str | Path | None = None,
+    row_filter_desc: str | None = None,
 ) -> str:
     """
     Confronta df_a (AS-IS) e df_b (TO-BE) e scrive un Excel con 6 fogli:
@@ -947,6 +948,8 @@ def build_excel_pair(
     ws_r.append([])
     ws_r.append(["Chiave di join rilevata:",
                  ", ".join(key_cols) if key_cols else "(confronto posizionale)"])
+    if row_filter_desc:
+        ws_r.append(["Filtro righe applicato:", row_filter_desc])
     _xl_autofit(ws_r)
     ws_r.freeze_panes = "A3"
 
@@ -1186,6 +1189,7 @@ def _load_to_sqlite(
     table: str,
     chunk_size: int = 50_000,
     log_cb: Callable[[str], None] | None = None,
+    row_filter: "dict[str, str] | None" = None,
 ) -> tuple[list[str], int]:
     """
     Carica un CSV (o ZIP entry) in una tabella SQLite a blocchi.
@@ -1197,6 +1201,13 @@ def _load_to_sqlite(
     for i, (cols, chunk) in enumerate(_iter_csv_chunks(path_str, sep, chunk_size)):
         if not col_names:
             col_names = cols
+        # Apply row filter per chunk
+        if row_filter:
+            for _fc, _fv in row_filter.items():
+                if _fc in chunk.columns:
+                    chunk = chunk[chunk[_fc].str.strip() == _fv.strip()]
+            if chunk.empty:
+                continue  # skip empty chunks after filtering
         chunk.to_sql(
             table, conn,
             if_exists="append" if i > 0 else "replace",
@@ -1232,6 +1243,7 @@ def build_excel_pair_large(
     max_only_rows: int = 5_000,
     chunk_size: int = 50_000,
     log_cb: "Callable[[str], None] | None" = None,
+    row_filter: "dict[str, str] | None" = None,
 ) -> str:
     """
     Confronta due grandi CSV via SQLite senza caricarli interamente in RAM.
@@ -1266,10 +1278,10 @@ def build_excel_pair_large(
 
         # ── Caricamento ──────────────────────────────────────────────────────
         _log("    Caricamento AS-IS → DB (stream)...")
-        cols_a, n_a = _load_to_sqlite(path_a, sep_a, conn, "asis", chunk_size, _log)
+        cols_a, n_a = _load_to_sqlite(path_a, sep_a, conn, "asis", chunk_size, _log, row_filter=row_filter)
 
         _log("    Caricamento TO-BE → DB (stream)...")
-        cols_b, n_b = _load_to_sqlite(path_b, sep_b, conn, "tobe", chunk_size, _log)
+        cols_b, n_b = _load_to_sqlite(path_b, sep_b, conn, "tobe", chunk_size, _log, row_filter=row_filter)
 
         cols_a_set = set(cols_a)
         cols_b_set = set(cols_b)
@@ -1401,6 +1413,9 @@ def build_excel_pair_large(
         ws_r.append(["Chiave di join:", ", ".join(key_cols) if key_cols else "(nessuna — confronto posizionale)"])
         ws_r.append(["Righe con match (join):", n_both if key_cols else "n/a"])
         ws_r.append(["Modalità elaborazione:", "STREAM  (file grande — confronto via SQLite)"])
+        if row_filter:
+            _filter_desc = "  AND  ".join(f"{k} = '{v}'" for k, v in row_filter.items())
+            ws_r.append(["Filtro righe applicato:", _filter_desc])
         if zero_match_warning:
             ws_r.append([])
             warn_row = ["⚠  ATTENZIONE: la chiave di join non ha trovato nessun match tra AS-IS e TO-BE. "
@@ -2008,6 +2023,7 @@ def run_comparison(
     join_key: list[str] | None = None,
     max_diff_rows: int = 10_000,
     progress_cb: Callable[[str], None] | None = None,
+    row_filter: dict[str, str] | None = None,
 ) -> list[str]:
     """
     Confronta tutte le coppie di file trovate in asis_path e tobe_path.
@@ -2117,6 +2133,7 @@ def run_comparison(
                     output_path=out_path,
                     join_key=join_key,
                     log_cb=_log,
+                    row_filter=row_filter,
                 )
                 generated.append(generated_path)
 
@@ -2152,6 +2169,16 @@ def run_comparison(
                     raw_b  = _get_raw_content(b_path_str)
                     n_ws_b = _detect_whitespace_in_raw(b_path_str, None, sep_b)
 
+                # ── Applica filtro righe se specificato ───────────────────
+                if row_filter:
+                    for _fc, _fv in row_filter.items():
+                        if _fc in df_a.columns:
+                            df_a = df_a[df_a[_fc].str.strip() == _fv.strip()].reset_index(drop=True)
+                        if _fc in df_b.columns:
+                            df_b = df_b[df_b[_fc].str.strip() == _fv.strip()].reset_index(drop=True)
+                    _filter_desc = "  AND  ".join(f"{k} = '{v}'" for k, v in row_filter.items())
+                    _log(f"  Filtro righe: {_filter_desc}  →  AS-IS {len(df_a):,} righe, TO-BE {len(df_b):,} righe")
+
                 # ── Rileva righe saltate ───────────────────────────────────
                 bad_lines_a = _find_bad_lines(raw_a, sep_a)
                 bad_lines_b = _find_bad_lines(raw_b, sep_b)
@@ -2173,6 +2200,8 @@ def run_comparison(
                         _log(f"    ... e altre {len(bad_lines_b) - 5} righe")
 
                 # ── Genera Excel per coppia ────────────────────────────────
+                _filter_desc = ("  AND  ".join(f"{k} = '{v}'" for k, v in row_filter.items())
+                                if row_filter else None)
                 generated_path = build_excel_pair(
                     label=label,
                     df_a=df_a,
@@ -2183,6 +2212,7 @@ def run_comparison(
                     join_key=join_key,
                     max_diff_rows=max_diff_rows,
                     log_path=log_path,
+                    row_filter_desc=_filter_desc,
                 )
                 generated.append(generated_path)
 

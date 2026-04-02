@@ -394,6 +394,22 @@ class FlowCheckApp(tk.Tk):
             "Campo (o campi separati da virgola) usato per abbinare le righe.  "
             "Es.: POLIZZA   oppure   POLIZZA,TIPO_MOV")
 
+        _divider(parent)
+
+        # Filtro righe
+        row3 = tk.Frame(parent, bg=_CARD)
+        row3.pack(fill="x", pady=(4, 0))
+        tk.Label(row3, text="Filtro righe:", font=_FT_H3,
+                 bg=_CARD, fg=_TEXT_SEC, width=20, anchor="w").pack(side="left")
+
+        self._filter_var = tk.StringVar()
+        ttk.Entry(row3, textvariable=self._filter_var,
+                  width=38, style="FC.TEntry", font=_FT).pack(side="left", padx=(0, 0))
+
+        _hint_label(parent,
+            "Limita il confronto alle righe che soddisfano la condizione.  "
+            "Es.:  COMPAGNIA_CD=00063   oppure   COMPAGNIA_CD=00063;TIPO=10")
+
     def _build_actions(self, parent: tk.Frame):
         left = tk.Frame(parent, bg=_CARD)
         left.pack(fill="x")
@@ -528,6 +544,22 @@ class FlowCheckApp(tk.Tk):
             return None
         cols = [c.strip() for c in self._jk_var.get().split(",") if c.strip()]
         return cols or None
+
+    def _get_row_filter(self) -> dict[str, str] | None:
+        import re as _re
+        text = self._filter_var.get().strip()
+        if not text:
+            return None
+        result = {}
+        for part in _re.split(r'[;\n]', text):
+            part = part.strip()
+            if '=' in part:
+                col, val = part.split('=', 1)
+                col = col.strip()
+                val = val.strip()
+                if col:
+                    result[col] = val
+        return result or None
 
     # ── Log ───────────────────────────────────────────────────────────────
 
@@ -678,11 +710,12 @@ class FlowCheckApp(tk.Tk):
     # ── Avvio confronto ────────────────────────────────────────────────────
 
     def _start_comparison(self):
-        asis     = self._asis_var.get().strip()
-        tobe     = self._tobe_var.get().strip()
-        out      = self._out_var.get().strip() or None
-        sep      = self._get_sep()
-        join_key = self._get_join_key()
+        asis       = self._asis_var.get().strip()
+        tobe       = self._tobe_var.get().strip()
+        out        = self._out_var.get().strip() or None
+        sep        = self._get_sep()
+        join_key   = self._get_join_key()
+        row_filter = self._get_row_filter()
 
         if not asis:
             messagebox.showwarning(
@@ -702,12 +735,13 @@ class FlowCheckApp(tk.Tk):
 
         threading.Thread(
             target=self._worker,
-            args=(asis, tobe, out, sep, join_key),
+            args=(asis, tobe, out, sep, join_key, row_filter),
             daemon=True,
         ).start()
 
     def _worker(self, asis: str, tobe: str, out: str | None,
-                sep: str | None, join_key: list[str] | None):
+                sep: str | None, join_key: list[str] | None,
+                row_filter: dict[str, str] | None = None):
         try:
             from flowcheck_engine import run_comparison
             generated = run_comparison(
@@ -717,6 +751,7 @@ class FlowCheckApp(tk.Tk):
                 sep=sep,
                 join_key=join_key,
                 progress_cb=self._q.put,
+                row_filter=row_filter,
             )
             if out is None and generated:
                 self._last_output_dir = str(Path(generated[0]).parent)
