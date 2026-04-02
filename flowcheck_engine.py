@@ -1070,6 +1070,464 @@ def build_excel_pair(
 # Rilevamento righe malformate (saltate da on_bad_lines='skip')
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Supporto file grandi — streaming + SQLite temporaneo
+# ---------------------------------------------------------------------------
+
+_LARGE_FILE_THRESHOLD = 200 * 1024 * 1024   # 200 MB → modalità streaming
+
+
+def _source_size(path_str: str) -> int:
+    """Dimensione stimata in byte del CSV (decompressa se inside ZIP)."""
+    try:
+        if "::" in path_str:
+            zp, ze = path_str.split("::", 1)
+            with zipfile.ZipFile(zp) as zf:
+                info = zf.getinfo(ze)
+                return info.file_size or info.compress_size
+        else:
+            return Path(path_str).stat().st_size
+    except Exception:
+        return 0
+
+
+def _iter_csv_chunks(
+    path_str: str,
+    sep: str,
+    chunk_size: int = 50_000,
+):
+    """
+    Genera coppie (col_names, chunk_df) leggendo un CSV a blocchi senza
+    caricarlo interamente in RAM.  Funziona sia su file CSV che su ZIP entry.
+    """
+    # ── Rileva encoding e header dalla prima lettura ──────────────────────────
+    if "::" in path_str:
+        zp, ze = path_str.split("::", 1)
+        with zipfile.ZipFile(zp) as zf:
+            with zf.open(ze) as fh:
+                first_bytes = fh.read(65536)
+    else:
+        with open(path_str, "rb") as fh:
+            first_bytes = fh.read(65536)
+
+    enc        = _detect_encoding(first_bytes)
+    first_text = first_bytes.decode(enc, errors="replace")
+    has_hdr    = _has_header_from_text(first_text, sep)
+    header_arg = 0 if has_hdr else None
+    eng        = "python" if len(sep) > 1 else "c"
+    sep_param  = re.escape(sep) if eng == "python" else sep
+
+    # ── Apre lo stream per la lettura completa ────────────────────────────────
+    if "::" in path_str:
+        zp, ze = path_str.split("::", 1)
+        outer_zf = zipfile.ZipFile(zp)
+        raw_fh   = outer_zf.open(ze)
+    else:
+        outer_zf = None
+        raw_fh   = open(path_str, "rb")
+
+    try:
+        import io as _io
+        text_fh = _io.TextIOWrapper(raw_fh, encoding=enc, errors="replace")
+        try:
+            reader = pd.read_csv(
+                text_fh,
+                sep=sep_param,
+                header=header_arg,
+                dtype=str,
+                chunksize=chunk_size,
+                engine=eng,
+                on_bad_lines="skip",
+                keep_default_na=False,
+                skipinitialspace=True,
+            )
+            col_names: list[str] = []
+            for i, chunk in enumerate(reader):
+                if i == 0:
+                    if header_arg is None:
+                        chunk.columns = [f"Col_{j+1}" for j in range(len(chunk.columns))]
+                    chunk.columns = _dedup_columns([str(c).strip() for c in chunk.columns])
+                    chunk = _strip_sep_prefixes(chunk, sep)
+                    chunk = chunk[[c for c in chunk.columns if not _is_artifact_col(c)]]
+                    col_names = list(chunk.columns)
+                else:
+                    # Allinea colonne ai nomi rilevati nel primo chunk
+                    if len(chunk.columns) >= len(col_names):
+                        chunk = chunk.iloc[:, :len(col_names)]
+                    chunk.columns = col_names[:len(chunk.columns)]
+                chunk = _clean_df(chunk)
+                yield col_names, chunk
+        finally:
+            try:
+                text_fh.detach()   # evita doppia chiusura di raw_fh
+            except Exception:
+                pass
+    finally:
+        try:
+            raw_fh.close()
+        except Exception:
+            pass
+        if outer_zf:
+            try:
+                outer_zf.close()
+            except Exception:
+                pass
+
+
+def _load_to_sqlite(
+    path_str: str,
+    sep: str,
+    conn: "object",         # sqlite3.Connection — importato inline
+    table: str,
+    chunk_size: int = 50_000,
+    log_cb: Callable[[str], None] | None = None,
+) -> tuple[list[str], int]:
+    """
+    Carica un CSV (o ZIP entry) in una tabella SQLite a blocchi.
+    Restituisce (nomi_colonne_normalizzati, n_righe_totali).
+    """
+    total: int      = 0
+    col_names: list[str] = []
+
+    for i, (cols, chunk) in enumerate(_iter_csv_chunks(path_str, sep, chunk_size)):
+        if not col_names:
+            col_names = cols
+        chunk.to_sql(
+            table, conn,
+            if_exists="append" if i > 0 else "replace",
+            index=False,
+            method="multi",
+            chunksize=2_000,
+        )
+        total += len(chunk)
+        if log_cb and (total % (chunk_size * 4) < chunk_size):
+            log_cb(f"    {table.upper()}: {total:,} righe caricate...")
+
+    if log_cb:
+        log_cb(f"    {table.upper()}: completato — {total:,} righe, {len(col_names)} colonne")
+    return col_names, total
+
+
+def _q(name: str) -> str:
+    """Quota un identificatore SQLite."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def build_excel_pair_large(
+    label: str,
+    path_a: str,
+    path_b: str,
+    sep_a: str,
+    sep_b: str,
+    asis_label: str,
+    tobe_label: str,
+    output_path: "str | Path",
+    join_key: "list[str] | None" = None,
+    max_diff_rows: int = 10_000,
+    max_only_rows: int = 5_000,
+    chunk_size: int = 50_000,
+    log_cb: "Callable[[str], None] | None" = None,
+) -> str:
+    """
+    Confronta due grandi CSV via SQLite senza caricarli interamente in RAM.
+    Produce il medesimo Excel a 6 fogli di build_excel_pair.
+
+    Flusso:
+      1. Legge AS-IS a chunk → SQLite 'asis'
+      2. Legge TO-BE a chunk → SQLite 'tobe'
+      3. Crea indici sulle chiavi di join
+      4. Esegue query SQL per: contatori, DIFF, SOLO_ASIS, SOLO_TOBE, SINTESI
+      5. Scrive l'Excel e cancella il DB temporaneo
+    """
+    import sqlite3 as _sqlite3
+    import tempfile as _tempfile
+
+    def _log(msg: str):
+        if log_cb:
+            log_cb(msg)
+
+    output_path = Path(output_path)
+
+    # ── DB temporaneo su disco ─────────────────────────────────────────────────
+    db_fd, db_path = _tempfile.mkstemp(suffix=".db", prefix="flowcheck_tmp_")
+    os.close(db_fd)
+    _log(f"    DB temporaneo: {db_path}")
+
+    try:
+        conn = _sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-262144")   # 256 MB cache SQLite
+
+        # ── Caricamento ──────────────────────────────────────────────────────
+        _log("    Caricamento AS-IS → DB (stream)...")
+        cols_a, n_a = _load_to_sqlite(path_a, sep_a, conn, "asis", chunk_size, _log)
+
+        _log("    Caricamento TO-BE → DB (stream)...")
+        cols_b, n_b = _load_to_sqlite(path_b, sep_b, conn, "tobe", chunk_size, _log)
+
+        cols_a_set = set(cols_a)
+        cols_b_set = set(cols_b)
+        common     = [c for c in cols_a if c in cols_b_set]
+        only_a_cols = sorted(cols_a_set - cols_b_set)
+        only_b_cols = sorted(cols_b_set - cols_a_set)
+
+        # ── Auto-detect chiave (su campione per non saturare RAM) ─────────────
+        if join_key is None:
+            if common:
+                sel_c = ", ".join(_q(c) for c in common)
+                smp_a = pd.read_sql(f"SELECT {sel_c} FROM asis  LIMIT 500000", conn)
+                smp_b = pd.read_sql(f"SELECT {sel_c} FROM tobe  LIMIT 500000", conn)
+                join_key = detect_join_key(smp_a, smp_b)
+                del smp_a, smp_b
+            else:
+                join_key = []
+
+        key_cols   = join_key or []
+        value_cols = [c for c in common if c not in key_cols]
+        _log(f"    Chiave: {', '.join(key_cols) if key_cols else '(nessuna — confronto posizionale)'}")
+
+        # ── Indici sulle chiavi ────────────────────────────────────────────────
+        if key_cols:
+            key_sql = ", ".join(_q(k) for k in key_cols)
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_asis ON asis ({key_sql})")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_tobe ON tobe ({key_sql})")
+            conn.commit()
+            _log("    Indici creati — avvio query di confronto...")
+
+        # ── Helper SQL ────────────────────────────────────────────────────────
+        def kj(ta: str = "a", tb: str = "b") -> str:
+            return " AND ".join(
+                f'COALESCE({ta}.{_q(k)},"") = COALESCE({tb}.{_q(k)},"")'
+                for k in key_cols
+            )
+
+        def dw(ta: str = "a", tb: str = "b") -> str:
+            if not value_cols:
+                return "1=0"
+            return " OR ".join(
+                f'COALESCE({ta}.{_q(c)},"") != COALESCE({tb}.{_q(c)},"")'
+                for c in value_cols
+            )
+
+        # ── Contatori (un'unica passata) ──────────────────────────────────────
+        if key_cols:
+            n_only_a = conn.execute(
+                f"SELECT COUNT(*) FROM asis a "
+                f"WHERE NOT EXISTS (SELECT 1 FROM tobe b WHERE {kj()})"
+            ).fetchone()[0]
+            n_only_b = conn.execute(
+                f"SELECT COUNT(*) FROM tobe b "
+                f"WHERE NOT EXISTS (SELECT 1 FROM asis a WHERE {kj('b','a')})"
+            ).fetchone()[0]
+            n_diff = conn.execute(
+                f"SELECT COUNT(*) FROM asis a "
+                f"INNER JOIN tobe b ON {kj()} WHERE {dw()}"
+            ).fetchone()[0]
+        else:
+            n_only_a = max(0, n_a - n_b)
+            n_only_b = max(0, n_b - n_a)
+            n_diff   = 0
+
+        ok_overall = (n_only_a == 0 and n_only_b == 0 and n_diff == 0 and n_a == n_b)
+
+        # ── SINTESI differenze per colonna (una sola JOIN) ────────────────────
+        sint_rows: list[dict] = []
+        if key_cols and value_cols:
+            cases = ", ".join(
+                f"SUM(CASE WHEN COALESCE(a.{_q(c)},'') != COALESCE(b.{_q(c)},'') "
+                f"THEN 1 ELSE 0 END) AS {_q('_d_' + c)}"
+                for c in value_cols[:300]
+            )
+            row = conn.execute(
+                f"SELECT COUNT(*) AS n_both, {cases} "
+                f"FROM asis a INNER JOIN tobe b ON {kj()}"
+            ).fetchone()
+            n_both = row[0]
+            for i, c in enumerate(value_cols[:300]):
+                nd = row[i + 1] or 0
+                sint_rows.append({
+                    "COLONNA": c, "CHIAVE": "No",
+                    "RIGHE UGUALI": n_both - nd, "RIGHE DIVERSE": nd,
+                    "TOT": n_both,
+                    "STATO": "OK" if nd == 0 else "DIFFERENZE",
+                })
+
+        # ── Workbook ──────────────────────────────────────────────────────────
+        wb  = openpyxl.Workbook()
+        wb.remove(wb.active)
+
+        # 1. RIEPILOGO
+        ws_r = wb.create_sheet("RIEPILOGO")
+        _xl_title(ws_r, f"Riepilogo confronto AS-IS vs TO-BE  —  {label}", 11)
+        ws_r.append(["FILE LOGICO", "FILE AS-IS", "FILE TO-BE",
+                     "RIGHE AS-IS", "RIGHE TO-BE", "DELTA RIGHE",
+                     "COL SOLO AS-IS", "COL SOLO TO-BE",
+                     "COLONNE CON DIFF", "RIGHE CON DIFF", "ESITO"])
+        _xl_hdr_row(ws_r, 2)
+        cols_w_diff = [r["COLONNA"] for r in sint_rows if r["STATO"] == "DIFFERENZE"]
+        ws_r.append([
+            label, asis_label, tobe_label,
+            n_a, n_b, n_a - n_b,
+            ", ".join(only_a_cols) or "—",
+            ", ".join(only_b_cols) or "—",
+            ", ".join(cols_w_diff[:10]) + ("…" if len(cols_w_diff) > 10 else "") or "—",
+            n_diff,
+            "OK" if ok_overall else "DIFFERENZE",
+        ])
+        _xl_data_row(ws_r, 3, _C_OK if ok_overall else _C_KO)
+        ws_r.append([])
+        ws_r.append(["Chiave di join:", ", ".join(key_cols) if key_cols else "(nessuna)"])
+        ws_r.append(["Modalità elaborazione:", "STREAM  (file grande — confronto via SQLite)"])
+        _xl_autofit(ws_r)
+        ws_r.freeze_panes = "A3"
+
+        # 2. STRUTTURA
+        ws_s = wb.create_sheet("STRUTTURA")
+        _xl_title(ws_s, f"Struttura colonne  —  {label}", 6)
+        ws_s.append(["COLONNA", "IN AS-IS", "IN TO-BE",
+                     "POS AS-IS", "POS TO-BE", "STATUS"])
+        _xl_hdr_row(ws_s, 2)
+        all_cols = cols_a + [c for c in cols_b if c not in cols_a_set]
+        for c in all_cols:
+            ia, ib = c in cols_a_set, c in cols_b_set
+            st = "OK" if (ia and ib) else ("SOLO AS-IS" if ia else "SOLO TO-BE")
+            ws_s.append([c,
+                         "Sì" if ia else "No", "Sì" if ib else "No",
+                         cols_a.index(c) + 1 if ia else "—",
+                         cols_b.index(c) + 1 if ib else "—",
+                         st])
+            rn = ws_s.max_row
+            if   st == "SOLO AS-IS":  _xl_data_row(ws_s, rn, _C_ONLY_AS)
+            elif st == "SOLO TO-BE":  _xl_data_row(ws_s, rn, _C_ONLY_TO)
+            else:                     _xl_data_row(ws_s, rn)
+        _xl_autofit(ws_s)
+        ws_s.freeze_panes = "A3"
+
+        # 3. SINTESI_COL
+        ws_sc = wb.create_sheet("SINTESI_COL")
+        _xl_title(ws_sc, f"Sintesi differenze per colonna  —  {label}", 6)
+        ws_sc.append(["COLONNA", "CHIAVE", "RIGHE UGUALI", "RIGHE DIVERSE",
+                      "TOT RIGHE", "STATO"])
+        _xl_hdr_row(ws_sc, 2)
+        if sint_rows:
+            for sr in sint_rows:
+                bg = _C_OK if sr["STATO"] == "OK" else _C_KO
+                ws_sc.append([sr["COLONNA"], sr["CHIAVE"],
+                               sr["RIGHE UGUALI"], sr["RIGHE DIVERSE"],
+                               sr["TOT"], sr["STATO"]])
+                _xl_data_row(ws_sc, ws_sc.max_row, bg)
+        else:
+            ws_sc.append(["(dati non disponibili senza chiave di join)"])
+        _xl_autofit(ws_sc)
+        ws_sc.freeze_panes = "A3"
+
+        # 4. DIFF
+        ws_d = wb.create_sheet("DIFF")
+        if key_cols and value_cols and n_diff > 0:
+            sel_k  = ", ".join(f"a.{_q(k)}" for k in key_cols)
+            sel_av = ", ".join(f'a.{_q(c)} AS {_q(c + "__AS")}' for c in value_cols)
+            sel_bv = ", ".join(f'b.{_q(c)} AS {_q(c + "__TO")}' for c in value_cols)
+            diff_df = pd.read_sql(
+                f"SELECT {sel_k}, {sel_av}, {sel_bv} "
+                f"FROM asis a INNER JOIN tobe b ON {kj()} "
+                f"WHERE {dw()} LIMIT {max_diff_rows}",
+                conn,
+            )
+            note = (f" — prime {max_diff_rows:,} su {n_diff:,}" if n_diff > max_diff_rows
+                    else f" — {n_diff:,} righe con diff")
+            hdr_d = list(key_cols)
+            for c in value_cols:
+                hdr_d += [f"{c} [AS-IS]", f"{c} [TO-BE]", f"DIFF {c}"]
+            _xl_title(ws_d, f"Differenze  —  {label}{note}", len(hdr_d))
+            ws_d.append(hdr_d)
+            _xl_hdr_row(ws_d, 2)
+            for i, (_, row) in enumerate(key_cols and diff_df.iterrows() or []):
+                rv = [row.get(k, "") for k in key_cols]
+                for c in value_cols:
+                    va, vb = row.get(f"{c}__AS", ""), row.get(f"{c}__TO", "")
+                    rv += [va, vb, _num_diff(va, vb)]
+                ws_d.append(rv)
+                rn = ws_d.max_row
+                _xl_data_row(ws_d, rn)
+                off = len(key_cols) + 1
+                for c in value_cols:
+                    if str(row.get(f"{c}__AS","")).strip() != str(row.get(f"{c}__TO","")).strip():
+                        ws_d.cell(rn, off).fill     = _xl_fill(_C_DIFF)
+                        ws_d.cell(rn, off + 1).fill = _xl_fill(_C_DIFF)
+                    off += 3
+            _xl_autofit(ws_d)
+            if key_cols:
+                ws_d.freeze_panes = f"{get_column_letter(len(key_cols)+1)}3"
+        else:
+            _xl_title(ws_d, f"Differenze  —  {label}", 1)
+            ws_d.append(["(nessuna differenza rilevata)" if n_diff == 0 else
+                          "(confronto non disponibile senza chiave di join)"])
+
+        # 5. SOLO_ASIS
+        ws_a = wb.create_sheet("SOLO_ASIS")
+        if key_cols:
+            sel = ", ".join(f"a.{_q(c)}" for c in cols_a)
+            q_a = (f"SELECT {sel} FROM asis a "
+                   f"WHERE NOT EXISTS (SELECT 1 FROM tobe b WHERE {kj()}) "
+                   f"LIMIT {max_only_rows}")
+        else:
+            q_a = f"SELECT * FROM asis LIMIT {max_only_rows}"
+        only_a_df = pd.read_sql(q_a, conn)
+        trunc_a   = n_only_a > max_only_rows
+        ttl_a = (f"Solo in AS-IS  —  {label}"
+                 + (f"  (prime {max_only_rows:,} su {n_only_a:,})" if trunc_a else ""))
+        _xl_title(ws_a, ttl_a, max(len(only_a_df.columns), 1))
+        if only_a_df.empty:
+            ws_a.append(["(nessuna riga esclusiva in AS-IS)"])
+        else:
+            ws_a.append(list(only_a_df.columns))
+            _xl_hdr_row(ws_a, 2)
+            for _, row in only_a_df.iterrows():
+                ws_a.append(list(row))
+                _xl_data_row(ws_a, ws_a.max_row, _C_ONLY_AS)
+        _xl_autofit(ws_a)
+
+        # 6. SOLO_TOBE
+        ws_t = wb.create_sheet("SOLO_TOBE")
+        if key_cols:
+            sel = ", ".join(f"b.{_q(c)}" for c in cols_b)
+            q_b = (f"SELECT {sel} FROM tobe b "
+                   f"WHERE NOT EXISTS (SELECT 1 FROM asis a WHERE {kj('b','a')}) "
+                   f"LIMIT {max_only_rows}")
+        else:
+            q_b = f"SELECT * FROM tobe LIMIT {max_only_rows}"
+        only_b_df = pd.read_sql(q_b, conn)
+        trunc_b   = n_only_b > max_only_rows
+        ttl_b = (f"Solo in TO-BE  —  {label}"
+                 + (f"  (prime {max_only_rows:,} su {n_only_b:,})" if trunc_b else ""))
+        _xl_title(ws_t, ttl_b, max(len(only_b_df.columns), 1))
+        if only_b_df.empty:
+            ws_t.append(["(nessuna riga esclusiva in TO-BE)"])
+        else:
+            ws_t.append(list(only_b_df.columns))
+            _xl_hdr_row(ws_t, 2)
+            for _, row in only_b_df.iterrows():
+                ws_t.append(list(row))
+                _xl_data_row(ws_t, ws_t.max_row, _C_ONLY_TO)
+        _xl_autofit(ws_t)
+
+        conn.close()
+        wb.save(output_path)
+        return str(output_path)
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(db_path)
+            _log("    DB temporaneo rimosso.")
+        except Exception:
+            pass
+
+
 def _get_raw_content(path_str: str, zip_entry: str | None = None) -> str:
     """Legge il contenuto grezzo da file CSV o da una entry ZIP, con encoding auto-detect."""
     if zip_entry:
@@ -1568,80 +2026,125 @@ def run_comparison(
             a_path_str = pair["asis_path"]
             b_path_str = pair["tobe_path"]
 
+            # ── Controlla dimensione: modalità streaming per file grandi ───
+            size_a   = _source_size(a_path_str)
+            size_b   = _source_size(b_path_str)
+            is_large = max(size_a, size_b) >= _LARGE_FILE_THRESHOLD
+
             if "::" in a_path_str:
                 zp_a, ze_a = a_path_str.split("::", 1)
-                sep_a  = sep if sep else detect_separator(zp_a, zip_entry=ze_a)
-                df_a   = read_csv_from_zip(zp_a, ze_a, sep=sep)
-                raw_a  = _get_raw_content(zp_a, ze_a)
-                n_ws_a = _detect_whitespace_in_raw(zp_a, ze_a, sep_a)
+                sep_a = sep if sep else detect_separator(zp_a, zip_entry=ze_a)
             else:
-                sep_a  = sep if sep else detect_separator(a_path_str)
-                df_a   = read_csv(a_path_str, sep=sep)
-                raw_a  = _get_raw_content(a_path_str)
-                n_ws_a = _detect_whitespace_in_raw(a_path_str, None, sep_a)
+                sep_a = sep if sep else detect_separator(a_path_str)
 
             if "::" in b_path_str:
                 zp_b, ze_b = b_path_str.split("::", 1)
-                sep_b  = sep if sep else detect_separator(zp_b, zip_entry=ze_b)
-                df_b   = read_csv_from_zip(zp_b, ze_b, sep=sep)
-                raw_b  = _get_raw_content(zp_b, ze_b)
-                n_ws_b = _detect_whitespace_in_raw(zp_b, ze_b, sep_b)
+                sep_b = sep if sep else detect_separator(zp_b, zip_entry=ze_b)
             else:
-                sep_b  = sep if sep else detect_separator(b_path_str)
-                df_b   = read_csv(b_path_str, sep=sep)
-                raw_b  = _get_raw_content(b_path_str)
-                n_ws_b = _detect_whitespace_in_raw(b_path_str, None, sep_b)
+                sep_b = sep if sep else detect_separator(b_path_str)
 
-            # ── Rileva righe saltate ───────────────────────────────────────
-            bad_lines_a = _find_bad_lines(raw_a, sep_a)
-            bad_lines_b = _find_bad_lines(raw_b, sep_b)
-
-            if bad_lines_a:
-                _log(f"  [ATTENZIONE] AS-IS {pair['asis_label']}: "
-                     f"{len(bad_lines_a)} righe saltate (campi non conformi)")
-                for ln, content in bad_lines_a[:5]:
-                    _log(f"    riga {ln}: {content[:120]}")
-                if len(bad_lines_a) > 5:
-                    _log(f"    ... e altre {len(bad_lines_a) - 5} righe")
-
-            if bad_lines_b:
-                _log(f"  [ATTENZIONE] TO-BE {pair['tobe_label']}: "
-                     f"{len(bad_lines_b)} righe saltate (campi non conformi)")
-                for ln, content in bad_lines_b[:5]:
-                    _log(f"    riga {ln}: {content[:120]}")
-                if len(bad_lines_b) > 5:
-                    _log(f"    ... e altre {len(bad_lines_b) - 5} righe")
-
-            # ── Genera Excel per coppia ────────────────────────────────────
+            # ── Output path condiviso ──────────────────────────────────────
             out_name = f"confronto_{label}_{ts}.xlsx"
             out_path = output_dir / out_name
 
-            generated_path = build_excel_pair(
-                label=label,
-                df_a=df_a,
-                df_b=df_b,
-                asis_label=pair["asis_label"],
-                tobe_label=pair["tobe_label"],
-                output_path=out_path,
-                join_key=join_key,
-                max_diff_rows=max_diff_rows,
-                log_path=log_path,
-            )
-            generated.append(generated_path)
+            if is_large:
+                # ── Modalità STREAMING (SQLite) ────────────────────────────
+                mb = max(size_a, size_b) / 1024 / 1024
+                _log(f"  [LARGE] File grande ({mb:.0f} MB) — modalità streaming SQLite")
 
-            # ── Raccoglie dati per issue log ───────────────────────────────
-            issue_records.append(_collect_pair_issues(
-                label=label,
-                asis_label=pair["asis_label"],
-                tobe_label=pair["tobe_label"],
-                df_a=df_a, df_b=df_b,
-                sep_a=sep_a, sep_b=sep_b,
-                n_ws_a=n_ws_a, n_ws_b=n_ws_b,
-                bad_lines_a=bad_lines_a,
-                bad_lines_b=bad_lines_b,
-            ))
+                generated_path = build_excel_pair_large(
+                    label=label,
+                    path_a=a_path_str,
+                    path_b=b_path_str,
+                    sep_a=sep_a,
+                    sep_b=sep_b,
+                    asis_label=pair["asis_label"],
+                    tobe_label=pair["tobe_label"],
+                    output_path=out_path,
+                    join_key=join_key,
+                    log_cb=_log,
+                )
+                generated.append(generated_path)
 
-            _log(f"  [OK] Excel salvato: {out_name}")
+                # Issue log minimale (senza df in memoria)
+                issue_records.append({
+                    "label":      label,
+                    "asis_label": pair["asis_label"],
+                    "tobe_label": pair["tobe_label"],
+                    "sep_a":      sep_a,
+                    "sep_b":      sep_b,
+                    "note":       f"Elaborazione streaming ({mb:.0f} MB)",
+                })
+
+                _log(f"  [OK] Excel salvato: {out_name}")
+
+            else:
+                # ── Modalità NORMALE (in-memory DataFrame) ─────────────────
+                if "::" in a_path_str:
+                    df_a   = read_csv_from_zip(zp_a, ze_a, sep=sep)
+                    raw_a  = _get_raw_content(zp_a, ze_a)
+                    n_ws_a = _detect_whitespace_in_raw(zp_a, ze_a, sep_a)
+                else:
+                    df_a   = read_csv(a_path_str, sep=sep)
+                    raw_a  = _get_raw_content(a_path_str)
+                    n_ws_a = _detect_whitespace_in_raw(a_path_str, None, sep_a)
+
+                if "::" in b_path_str:
+                    df_b   = read_csv_from_zip(zp_b, ze_b, sep=sep)
+                    raw_b  = _get_raw_content(zp_b, ze_b)
+                    n_ws_b = _detect_whitespace_in_raw(zp_b, ze_b, sep_b)
+                else:
+                    df_b   = read_csv(b_path_str, sep=sep)
+                    raw_b  = _get_raw_content(b_path_str)
+                    n_ws_b = _detect_whitespace_in_raw(b_path_str, None, sep_b)
+
+                # ── Rileva righe saltate ───────────────────────────────────
+                bad_lines_a = _find_bad_lines(raw_a, sep_a)
+                bad_lines_b = _find_bad_lines(raw_b, sep_b)
+
+                if bad_lines_a:
+                    _log(f"  [ATTENZIONE] AS-IS {pair['asis_label']}: "
+                         f"{len(bad_lines_a)} righe saltate (campi non conformi)")
+                    for ln, content in bad_lines_a[:5]:
+                        _log(f"    riga {ln}: {content[:120]}")
+                    if len(bad_lines_a) > 5:
+                        _log(f"    ... e altre {len(bad_lines_a) - 5} righe")
+
+                if bad_lines_b:
+                    _log(f"  [ATTENZIONE] TO-BE {pair['tobe_label']}: "
+                         f"{len(bad_lines_b)} righe saltate (campi non conformi)")
+                    for ln, content in bad_lines_b[:5]:
+                        _log(f"    riga {ln}: {content[:120]}")
+                    if len(bad_lines_b) > 5:
+                        _log(f"    ... e altre {len(bad_lines_b) - 5} righe")
+
+                # ── Genera Excel per coppia ────────────────────────────────
+                generated_path = build_excel_pair(
+                    label=label,
+                    df_a=df_a,
+                    df_b=df_b,
+                    asis_label=pair["asis_label"],
+                    tobe_label=pair["tobe_label"],
+                    output_path=out_path,
+                    join_key=join_key,
+                    max_diff_rows=max_diff_rows,
+                    log_path=log_path,
+                )
+                generated.append(generated_path)
+
+                # ── Raccoglie dati per issue log ───────────────────────────
+                issue_records.append(_collect_pair_issues(
+                    label=label,
+                    asis_label=pair["asis_label"],
+                    tobe_label=pair["tobe_label"],
+                    df_a=df_a, df_b=df_b,
+                    sep_a=sep_a, sep_b=sep_b,
+                    n_ws_a=n_ws_a, n_ws_b=n_ws_b,
+                    bad_lines_a=bad_lines_a,
+                    bad_lines_b=bad_lines_b,
+                ))
+
+                _log(f"  [OK] Excel salvato: {out_name}")
 
         except Exception as exc:
             log_error(log_path, label, exc)
