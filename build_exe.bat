@@ -27,6 +27,7 @@ python -m PyInstaller ^
     --onefile ^
     --windowed ^
     --name "FlowCheck" ^
+    --hidden-import duckdb ^
     --hidden-import pandas ^
     --hidden-import pandas._libs.tslibs.base ^
     --hidden-import pandas._libs.tslibs.nattype ^
