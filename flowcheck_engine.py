@@ -189,6 +189,48 @@ def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.apply(lambda col: _clean_str_series(col) if col.dtype == object else col)
 
 
+def _strip_sep_prefixes(df: pd.DataFrame, sep: str) -> pd.DataFrame:
+    """
+    Rimuove il prefisso del separatore dai nomi colonna e dai valori stringa.
+
+    Problema: con separatori composti come ';£' o ';#', il PRIMO campo di ogni
+    riga NON è preceduto dal separatore, quindi mantiene il carattere-prefisso:
+
+        '£NUM_CONTR;£POLIZZA;£TIPO_MOV'  split by ';£'
+        → ['£NUM_CONTR',  'POLIZZA', 'TIPO_MOV', ...]
+          ^--- £ rimane!
+
+    Mentre il TO-BE (separatore ';' senza prefisso) produce:
+        ['NUM_CONTR', 'POLIZZA', 'TIPO_MOV', ...]
+
+    Questo causa disallineamento: £NUM_CONTR ≠ NUM_CONTR → chiave non trovata,
+    valori finiscono nella colonna sbagliata (shift di una posizione a sinistra).
+
+    Fix: si ricavano i caratteri speciali del separatore (non alfanumerici,
+    non underscore) e si esegue un lstrip su tutti i nomi colonna e su tutti
+    i valori stringa.  lstrip è sicuro perché rimuove solo dal margine sinistro.
+    """
+    # Caratteri speciali (non alfanumerici, non _) presenti nel separatore
+    strip_chars = ''.join(c for c in sep if not (c.isalnum() or c == '_'))
+    if not strip_chars:
+        return df
+
+    # 1. Strip dai nomi colonna
+    new_cols = [c.lstrip(strip_chars) for c in df.columns]
+    # Re-dedup nel caso lo stripping crei nomi duplicati
+    new_cols = _dedup_columns(new_cols)
+
+    df = df.copy()
+    df.columns = new_cols
+
+    # 2. Strip dai valori stringa (solo lstrip: non tocca caratteri interni)
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].str.lstrip(strip_chars)
+
+    return df
+
+
 def _dedup_columns(cols: list[str]) -> list[str]:
     seen: dict[str, int] = {}
     result = []
@@ -287,6 +329,8 @@ def read_csv(filepath: str | Path, sep: str | None = None) -> pd.DataFrame:
     if hdr is None:
         df.columns = [f"Col_{i + 1}" for i in range(len(df.columns))]
     df.columns = _dedup_columns([str(c).strip() for c in df.columns])
+    # Rimuovi prefissi separatore da nomi colonna e valori (fix shift prima colonna)
+    df = _strip_sep_prefixes(df, sep)
     # Rimuovi colonne-artefatto: nome vuoto o solo caratteri speciali (es. '#', '£')
     df = df[[c for c in df.columns if not _is_artifact_col(c)]]
     df = _clean_df(df)
@@ -346,6 +390,8 @@ def read_csv_from_zip(zip_path: str | Path, csv_name: str, sep: str | None = Non
     if hdr is None:
         df.columns = [f"Col_{i + 1}" for i in range(len(df.columns))]
     df.columns = _dedup_columns([str(c).strip() for c in df.columns])
+    # Rimuovi prefissi separatore da nomi colonna e valori (fix shift prima colonna)
+    df = _strip_sep_prefixes(df, sep)
     # Rimuovi colonne-artefatto: nome vuoto o solo caratteri speciali (es. '#', '£')
     df = df[[c for c in df.columns if not _is_artifact_col(c)]]
     df = _clean_df(df)
