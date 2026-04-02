@@ -1268,9 +1268,10 @@ def build_excel_pair_large(
     output_path = Path(output_path)
 
     # ── File DuckDB temporanei (uno per lato, per caricamento parallelo) ───────
-    _, db_path_a = _tempfile.mkstemp(suffix=".duckdb", prefix="flowcheck_a_")
-    _, db_path_b = _tempfile.mkstemp(suffix=".duckdb", prefix="flowcheck_b_")
-    # DuckDB crea i propri file — eliminiamo i placeholder creati da mkstemp
+    fd_a, db_path_a = _tempfile.mkstemp(suffix=".duckdb", prefix="flowcheck_a_")
+    fd_b, db_path_b = _tempfile.mkstemp(suffix=".duckdb", prefix="flowcheck_b_")
+    # mkstemp lascia il fd aperto — chiudiamolo prima di unlink (richiesto su Windows)
+    os.close(fd_a); os.close(fd_b)
     os.unlink(db_path_a)
     os.unlink(db_path_b)
 
