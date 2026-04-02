@@ -69,7 +69,7 @@ def _card(parent: tk.Widget, padx: int = 18, pady: int = 14) -> tuple[tk.Frame, 
 def _card_header(card: tk.Frame, icon: str, title: str, hint: str = "") -> tk.Frame:
     """Barra intestazione di una card con icona + titolo + hint opzionale."""
     hdr = tk.Frame(card, bg=_CARD_HDR, padx=0, pady=8)
-    hdr.pack(fill="x", padx=-18, pady=(  -14, 10))   # sfora il padding della card
+    hdr.pack(fill="x", pady=(0, 10))
     tk.Frame(hdr, bg=_BORDER, height=1).pack(fill="x", side="bottom")
 
     inner = tk.Frame(hdr, bg=_CARD_HDR)
