@@ -1182,6 +1182,23 @@ def _iter_csv_chunks(
                 pass
 
 
+def _sqlite_executemany_insert(table, conn, keys, data_iter):
+    """
+    Metodo di insert per pandas to_sql che usa executemany con placeholder ?
+    (stile SQLite nativo). Evita completamente il limite 'too many SQL variables'
+    che colpisce method='multi' quando cols > ~15 oppure rows×cols > 999.
+    Lo statement viene preparato una sola volta e riutilizzato per tutte le righe:
+    prestazioni buone anche su file con 100+ colonne.
+    """
+    data = list(data_iter)
+    if not data:
+        return
+    placeholders = ", ".join(["?"] * len(keys))
+    quoted_cols  = ", ".join(f'"{k}"' for k in keys)
+    stmt = f'INSERT INTO "{table.name}" ({quoted_cols}) VALUES ({placeholders})'
+    conn.executemany(stmt, data)
+
+
 def _load_to_sqlite(
     path_str: str,
     sep: str,
@@ -1208,17 +1225,13 @@ def _load_to_sqlite(
                     chunk = chunk[chunk[_fc].str.strip() == _fv.strip()]
             if chunk.empty:
                 continue  # skip empty chunks after filtering
-        # SQLite limita a 999 variabili per statement.
-        # Con method='multi' ogni batch inserisce rows × cols variabili,
-        # quindi calcoliamo il massimo numero di righe per batch in modo dinamico.
-        _SQLITE_MAX_VARS = 999
-        _sql_batch = max(1, _SQLITE_MAX_VARS // max(len(chunk.columns), 1))
+        # Usa executemany nativo SQLite: nessun limite su variabili,
+        # statement preparato una volta sola → performante su file 100+ colonne.
         chunk.to_sql(
             table, conn,
             if_exists="append" if i > 0 else "replace",
             index=False,
-            method="multi",
-            chunksize=_sql_batch,
+            method=_sqlite_executemany_insert,
         )
         total += len(chunk)
         if log_cb and (total % (chunk_size * 4) < chunk_size):
