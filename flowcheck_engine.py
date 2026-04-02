@@ -125,9 +125,16 @@ def _build_sep_candidates(lines: list[str]) -> list[str]:
         # accettiamo il candidato se appare in almeno il 50% delle righe non vuote
         threshold = max(1, len(non_empty_lines) * 0.5)
         if count >= threshold:
-            compound = f";{best_char}"
-            if compound not in cands:
-                cands.insert(0, compound)   # massima priorita'
+            # Controllo aggiuntivo: ';X' e' un VERO separatore composto solo se
+            # OGNI ';' nel file e' seguito da X.
+            # Se alcuni ';' non sono seguiti da X (es. ultimo campo senza prefisso),
+            # allora X e' un prefisso-valore, non parte del separatore.
+            # In quel caso NON inseriamo il composto e usiamo solo ';'.
+            total_semi = sum(line.count(';') for line in non_empty_lines)
+            if count >= total_semi:
+                compound = f";{best_char}"
+                if compound not in cands:
+                    cands.insert(0, compound)   # massima priorita'
 
     return cands
 
@@ -185,47 +192,75 @@ def _clean_str_series(s: pd.Series) -> pd.Series:
 
 
 def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Applica _clean_str_series a tutte le colonne stringa del DataFrame."""
-    return df.apply(lambda col: _clean_str_series(col) if col.dtype == object else col)
+    """Applica _clean_str_series a tutte le colonne stringa del DataFrame.
+    Usa is_string_dtype per compatibilità con pandas 2.0+ (StringDtype != object)."""
+    return df.apply(
+        lambda col: _clean_str_series(col)
+        if pd.api.types.is_string_dtype(col) or col.dtype == object
+        else col
+    )
 
 
 def _strip_sep_prefixes(df: pd.DataFrame, sep: str) -> pd.DataFrame:
     """
-    Rimuove il prefisso del separatore dai nomi colonna e dai valori stringa.
+    Rimuove il prefisso del separatore/valore dai nomi colonna e dai valori stringa.
 
-    Problema: con separatori composti come ';£' o ';#', il PRIMO campo di ogni
-    riga NON è preceduto dal separatore, quindi mantiene il carattere-prefisso:
+    Contesti gestiti:
+    A) sep=';£'  (PLZCA): primo campo mantiene '£' → '£NUM_CONTR' → 'NUM_CONTR'
+    B) sep=';'   (ABK001FW): ogni valore ha prefisso '£' → '£NUM_CONTR' → 'NUM_CONTR'
+    C) sep=';#'  (TO-BE):   '#MITT' → 'MITT'
 
-        '£NUM_CONTR;£POLIZZA;£TIPO_MOV'  split by ';£'
-        → ['£NUM_CONTR',  'POLIZZA', 'TIPO_MOV', ...]
-          ^--- £ rimane!
-
-    Mentre il TO-BE (separatore ';' senza prefisso) produce:
-        ['NUM_CONTR', 'POLIZZA', 'TIPO_MOV', ...]
-
-    Questo causa disallineamento: £NUM_CONTR ≠ NUM_CONTR → chiave non trovata,
-    valori finiscono nella colonna sbagliata (shift di una posizione a sinistra).
-
-    Fix: si ricavano i caratteri speciali del separatore (non alfanumerici,
-    non underscore) e si esegue un lstrip su tutti i nomi colonna e su tutti
-    i valori stringa.  lstrip è sicuro perché rimuove solo dal margine sinistro.
+    Strategia in due fasi:
+    1. Ricava i caratteri speciali del separatore (parte non-alfanumerica).
+    2. Se dopo lo strip dal separatore i nomi colonna o i valori hanno ancora
+       un prefisso non-alfanumerico noto (£ # ; | , @ ~), lo aggiunge al set
+       di caratteri da eliminare (prefisso-valore indipendente dal separatore).
     """
-    # Caratteri speciali (non alfanumerici, non _) presenti nel separatore
-    strip_chars = ''.join(c for c in sep if not (c.isalnum() or c == '_'))
-    if not strip_chars:
+    _KNOWN_VALUE_PREFIXES = frozenset('£#;|,@~')
+
+    # 1. Caratteri speciali del separatore
+    strip_set = {c for c in sep if not (c.isalnum() or c == '_')}
+
+    # 2. Rileva prefisso-valore dai nomi colonna
+    #    (copre il caso sep=';' dove '£' NON è nel separatore)
+    for col in df.columns:
+        if col and col[0] in _KNOWN_VALUE_PREFIXES and col[0] not in strip_set:
+            candidate = col[0]
+            n_with = sum(1 for c in df.columns if c.startswith(candidate))
+            # Accettiamo se almeno il 30% delle colonne porta il prefisso
+            if n_with >= max(1, len(df.columns) * 0.30):
+                strip_set.add(candidate)
+            break
+
+    # 3. Rileva prefisso-valore dai dati della prima colonna (fallback)
+    if df.columns.size > 0:
+        sample = df[df.columns[0]].dropna().head(30)
+        for val in sample:
+            if isinstance(val, str) and len(val) > 1 and val[0] in _KNOWN_VALUE_PREFIXES:
+                candidate = val[0]
+                if candidate not in strip_set:
+                    n_match = sum(1 for v in sample
+                                  if isinstance(v, str) and v.startswith(candidate))
+                    if n_match >= len(sample) * 0.50:
+                        strip_set.add(candidate)
+                break
+
+    if not strip_set:
         return df
 
-    # 1. Strip dai nomi colonna
+    strip_chars = ''.join(sorted(strip_set))
+
+    # Strip dai nomi colonna
     new_cols = [c.lstrip(strip_chars) for c in df.columns]
-    # Re-dedup nel caso lo stripping crei nomi duplicati
     new_cols = _dedup_columns(new_cols)
 
     df = df.copy()
     df.columns = new_cols
 
-    # 2. Strip dai valori stringa (solo lstrip: non tocca caratteri interni)
+    # Strip dai valori stringa (solo lstrip: non tocca caratteri interni).
+    # pd.api.types.is_string_dtype cattura sia 'object' che StringDtype (pandas 2.0+).
     for col in df.columns:
-        if df[col].dtype == object:
+        if pd.api.types.is_string_dtype(df[col]):
             df[col] = df[col].str.lstrip(strip_chars)
 
     return df
@@ -269,8 +304,14 @@ def _has_header_from_text(text: str, sep: str) -> bool:
     if not non_empty:
         return True
 
+    # Rimuovi prefissi-valore noti (£, #, ;, |, …) prima del test sul pattern.
+    # Questo gestisce file DWH dove i nomi colonna hanno prefisso separatore
+    # (es. '£NUM_CONTR' → 'NUM_CONTR', '#MITT' → 'MITT').
+    _PFXS = '£#;|,@~'
+    cleaned = [v.lstrip(_PFXS) for v in non_empty]
+
     col_pat = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-    col_like = [v for v in non_empty if col_pat.match(v) and not v.isdigit()]
+    col_like = [v for v in cleaned if col_pat.match(v) and not v.isdigit()]
     ratio = len(col_like) / len(non_empty)
     has_underscore = any("_" in v for v in col_like)
 
