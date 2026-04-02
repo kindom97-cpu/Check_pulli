@@ -1,5 +1,4 @@
-# flowcheck_app.py
-# Interfaccia grafica tkinter per FlowCheck — design user-friendly
+# flowcheck_app.py  —  FlowCheck  |  UI moderna ispirata a VS Code / GitHub Desktop
 
 from __future__ import annotations
 
@@ -14,405 +13,479 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-# ---------------------------------------------------------------------------
-# Palette colori
-# ---------------------------------------------------------------------------
-_BG         = "#F0F4F8"   # sfondo generale
-_CARD       = "#FFFFFF"   # sfondo card
-_HEADER_BG  = "#1E3A5F"   # intestazione
-_HEADER_SUB = "#2E5F9A"
-_PRIMARY    = "#1A6BBF"   # bottone principale
-_PRIMARY_HO = "#155799"   # hover
-_SUCCESS    = "#1A7A4A"
-_MUTED      = "#718096"   # testo secondario
-_BORDER     = "#CBD5E0"   # bordo card
-_TEXT       = "#2D3748"
-_WHITE      = "#FFFFFF"
+# ──────────────────────────────────────────────────────────────────────────────
+# Design tokens
+# ──────────────────────────────────────────────────────────────────────────────
+_BG          = "#F5F7FA"   # sfondo generale
+_CARD        = "#FFFFFF"   # card
+_CARD_HDR    = "#FAFBFC"   # intestazione card
+_BORDER      = "#E0E6ED"   # bordo sottile
+_SHADOW      = "#D1D9E6"   # simulazione ombra
+_PRIMARY     = "#2D7FF9"   # blu principale
+_PRIMARY_DK  = "#1C5DC1"   # blu hover / pressed
+_PRIMARY_LT  = "#EBF3FF"   # blu pallido (bg secondario)
+_SUCCESS     = "#16A34A"
+_WARN_BG     = "#FFF8E7"
+_ERROR_BG    = "#FFF1F0"
+_TEXT        = "#1A202C"   # testo principale
+_TEXT_SEC    = "#4A5568"   # testo secondario
+_TEXT_MUTED  = "#9CA3AF"   # testo tenue
+_WHITE       = "#FFFFFF"
 
-_F_TITLE  = ("Segoe UI", 16, "bold")
-_F_SUB    = ("Segoe UI",  9)
-_F_LABEL  = ("Segoe UI", 10)
-_F_BOLD   = ("Segoe UI", 10, "bold")
-_F_SECT   = ("Segoe UI", 10, "bold")
-_F_HINT   = ("Segoe UI",  8)
-_F_MONO   = ("Consolas",  9)
-_F_BTN    = ("Segoe UI", 10, "bold")
+# Tipografia
+_FT   = ("Segoe UI", 10)
+_FT_S = ("Segoe UI",  9)
+_FT_XS= ("Segoe UI",  8)
+_FT_B = ("Segoe UI", 10, "bold")
+_FT_H1= ("Segoe UI", 18, "bold")
+_FT_H2= ("Segoe UI", 11, "bold")
+_FT_H3= ("Segoe UI", 10, "bold")
+_FT_M = ("Consolas",  9)
 
 SEP_OPTIONS = [
-    ("Rilevamento automatico",  None),
-    (";  (punto e virgola)",    ";"),
-    (",  (virgola)",            ","),
-    ("\\t  (tabulazione)",      "\t"),
-    ("|  (pipe)",               "|"),
-    (";|  (composto)",          ";|"),
-    (";£  (composto £)",        ";£"),
-    ("Personalizzato…",         "__custom__"),
+    ("Rilevamento automatico", None),
+    (";  punto e virgola",     ";"),
+    (",  virgola",             ","),
+    ("\\t  tabulazione",       "\t"),
+    ("|  pipe",                "|"),
+    (";|  composto",           ";|"),
+    (";£  composto £",         ";£"),
+    ("Personalizzato…",        "__custom__"),
 ]
 
 
-# ---------------------------------------------------------------------------
-# Utilità: card con bordo arrotondato simulato
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Componenti riusabili
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _card(parent, **kw) -> tk.Frame:
-    """Frame bianco con bordo sottile — simula una card."""
-    outer = tk.Frame(parent, bg=_BORDER, padx=1, pady=1)
-    inner = tk.Frame(outer, bg=_CARD, **kw)
-    inner.pack(fill="both", expand=True)
-    return outer, inner
-
-
-def _hint(parent, text: str):
-    """Etichetta descrittiva grigia sotto un campo."""
-    tk.Label(parent, text=text, font=_F_HINT, bg=_CARD,
-             fg=_MUTED, anchor="w").pack(fill="x", padx=2, pady=(0, 6))
+def _card(parent: tk.Widget, padx: int = 18, pady: int = 14) -> tuple[tk.Frame, tk.Frame]:
+    """Card bianca con bordo sottile + simulazione ombra."""
+    shadow = tk.Frame(parent, bg=_SHADOW)
+    inner  = tk.Frame(shadow, bg=_CARD, padx=padx, pady=pady)
+    inner.pack(fill="both", expand=True, padx=(0, 1), pady=(0, 1))
+    return shadow, inner
 
 
-def _section_label(parent, text: str):
-    tk.Label(parent, text=text, font=_F_SECT, bg=_CARD,
-             fg=_TEXT).pack(anchor="w", pady=(10, 2))
+def _card_header(card: tk.Frame, icon: str, title: str, hint: str = "") -> tk.Frame:
+    """Barra intestazione di una card con icona + titolo + hint opzionale."""
+    hdr = tk.Frame(card, bg=_CARD_HDR, padx=0, pady=8)
+    hdr.pack(fill="x", padx=-18, pady=(  -14, 10))   # sfora il padding della card
+    tk.Frame(hdr, bg=_BORDER, height=1).pack(fill="x", side="bottom")
+
+    inner = tk.Frame(hdr, bg=_CARD_HDR)
+    inner.pack(fill="x", padx=18)
+    tk.Label(inner, text=f"{icon}  {title}", font=_FT_H2,
+             bg=_CARD_HDR, fg=_TEXT).pack(side="left")
+    if hint:
+        tk.Label(inner, text=hint, font=_FT_XS,
+                 bg=_CARD_HDR, fg=_TEXT_MUTED).pack(side="left", padx=(10, 0))
+    return hdr
 
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
+def _field_label(parent: tk.Frame, text: str):
+    tk.Label(parent, text=text, font=_FT_H3,
+             bg=_CARD, fg=_TEXT_SEC).pack(anchor="w", pady=(8, 2))
+
+
+def _hint_label(parent: tk.Frame, text: str):
+    tk.Label(parent, text=text, font=_FT_XS,
+             bg=_CARD, fg=_TEXT_MUTED, anchor="w").pack(fill="x", pady=(1, 6))
+
+
+def _divider(parent: tk.Frame):
+    tk.Frame(parent, bg=_BORDER, height=1).pack(fill="x", pady=10)
+
+
+def _icon_button(parent: tk.Frame, icon: str, label: str,
+                 command, style: str = "secondary") -> tk.Button:
+    """Pulsante con icona + testo. style = 'primary' | 'secondary' | 'ghost'."""
+    cfg = {
+        "primary":   dict(bg=_PRIMARY,    fg=_WHITE,     ab=_PRIMARY_DK, af=_WHITE),
+        "secondary": dict(bg=_WHITE,      fg=_TEXT,      ab="#EEF2F7",   af=_TEXT),
+        "ghost":     dict(bg=_BG,         fg=_TEXT_SEC,  ab=_BORDER,     af=_TEXT),
+    }[style]
+    btn = tk.Button(
+        parent, text=f"  {icon}  {label}  ",
+        font=_FT_B if style == "primary" else _FT,
+        bg=cfg["bg"], fg=cfg["fg"],
+        activebackground=cfg["ab"], activeforeground=cfg["af"],
+        relief="flat", cursor="hand2", bd=0,
+        padx=4, pady=8 if style == "primary" else 6,
+        command=command,
+    )
+    # Hover effect
+    btn.bind("<Enter>", lambda _: btn.config(bg=cfg["ab"], fg=cfg["af"]))
+    btn.bind("<Leave>", lambda _: btn.config(bg=cfg["bg"], fg=cfg["fg"]))
+    return btn
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Applicazione
+# ──────────────────────────────────────────────────────────────────────────────
 
 class FlowCheckApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
         self.title("FlowCheck")
-        self.geometry("920x740")
-        self.minsize(800, 620)
+        self.geometry("960x820")
+        self.minsize(820, 660)
         self.configure(bg=_BG)
         self.resizable(True, True)
 
-        self._q: queue.Queue[str | None] = queue.Queue()
-        self._running = False
-        self._last_output_dir: str | None = None
-        self._adv_visible = False   # pannello opzioni avanzate
+        self._q:                queue.Queue[str | None] = queue.Queue()
+        self._running:          bool  = False
+        self._last_output_dir:  str | None = None
+        self._adv_visible:      bool  = False
+        self._prog_t_run_start: float | None = None
+        self._prog_t_file_start:float | None = None
+        self._prog_timer_id:    str | None = None
+        self._prog_total:       int   = 1
+        self._prog_done:        int   = 0
 
-        self._apply_style()
+        self._setup_styles()
         self._build_ui()
         self._poll_queue()
 
-    # ------------------------------------------------------------------
-    # ttk Style
-    # ------------------------------------------------------------------
+    # ── ttk styles ──────────────────────────────────────────────────────────
 
-    def _apply_style(self):
+    def _setup_styles(self):
         s = ttk.Style(self)
         s.theme_use("clam")
-        s.configure("TEntry",    fieldbackground=_WHITE, bordercolor=_BORDER,
-                    relief="flat", padding=5)
-        s.configure("TCombobox", fieldbackground=_WHITE, bordercolor=_BORDER,
-                    padding=5)
-        s.configure("TButton",   background=_BG, relief="flat", padding=(8, 4))
-        s.map("TButton",
-              background=[("active", "#E2E8F0"), ("disabled", "#EDF2F7")],
-              foreground=[("disabled", "#A0AEC0")])
 
-    # ------------------------------------------------------------------
-    # Costruzione UI
-    # ------------------------------------------------------------------
+        # Entry
+        s.configure("FC.TEntry",
+                     fieldbackground=_WHITE,
+                     bordercolor=_BORDER,
+                     lightcolor=_BORDER,
+                     darkcolor=_BORDER,
+                     relief="solid",
+                     padding=(10, 7))
+        s.map("FC.TEntry",
+              bordercolor=[("focus", _PRIMARY), ("hover", "#A0AEC0")],
+              lightcolor =[("focus", _PRIMARY)],
+              darkcolor  =[("focus", _PRIMARY)])
+
+        # Combobox
+        s.configure("FC.TCombobox",
+                     fieldbackground=_WHITE,
+                     bordercolor=_BORDER,
+                     padding=(8, 6))
+        s.map("FC.TCombobox",
+              bordercolor=[("focus", _PRIMARY)])
+
+        # Progress bar (in corso)
+        s.configure("FC.Horizontal.TProgressbar",
+                     troughcolor=_BORDER,
+                     background=_PRIMARY,
+                     thickness=8,
+                     bordercolor=_BORDER,
+                     lightcolor=_PRIMARY,
+                     darkcolor=_PRIMARY)
+        # Progress bar (completata)
+        s.configure("FCDone.Horizontal.TProgressbar",
+                     troughcolor=_BORDER,
+                     background=_SUCCESS,
+                     thickness=8,
+                     bordercolor=_BORDER,
+                     lightcolor=_SUCCESS,
+                     darkcolor=_SUCCESS)
+
+    # ── UI principale ───────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # ── Header ────────────────────────────────────────────────────
-        hdr = tk.Frame(self, bg=_HEADER_BG, height=68)
+        # ── Header ──────────────────────────────────────────────────────
+        self._build_header()
+
+        # ── Status bar (fondo) ──────────────────────────────────────────
+        self._status_var = tk.StringVar(value="Pronto")
+        status = tk.Frame(self, bg=_BORDER, height=1)
+        status.pack(fill="x", side="bottom")
+        self._statusbar = tk.Label(
+            self, textvariable=self._status_var,
+            font=_FT_XS, bg=_CARD_HDR, fg=_TEXT_MUTED,
+            anchor="w", padx=20, pady=5)
+        self._statusbar.pack(fill="x", side="bottom")
+
+        # ── Corpo scrollabile ────────────────────────────────────────────
+        canvas = tk.Canvas(self, bg=_BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        self._body = tk.Frame(canvas, bg=_BG)
+        win_id = canvas.create_window((0, 0), window=self._body, anchor="nw")
+
+        def _on_frame_configure(_e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        def _on_canvas_configure(e):
+            canvas.itemconfig(win_id, width=e.width)
+
+        self._body.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.bind_all("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(-1*(e.delta//120), "units"))
+
+        self._build_body(self._body)
+
+    def _build_header(self):
+        hdr = tk.Frame(self, bg=_WHITE)
         hdr.pack(fill="x")
-        hdr.pack_propagate(False)
+        tk.Frame(hdr, bg=_BORDER, height=1).pack(fill="x", side="bottom")
 
-        tk.Label(hdr, text="FlowCheck", font=_F_TITLE,
-                 bg=_HEADER_BG, fg=_WHITE).pack(side="left", padx=20, pady=(12, 2),
-                                                anchor="sw")
-        tk.Label(hdr,
+        inner = tk.Frame(hdr, bg=_WHITE, pady=14)
+        inner.pack(fill="x", padx=24)
+
+        # Logo / titolo
+        logo_frame = tk.Frame(inner, bg=_WHITE)
+        logo_frame.pack(side="left")
+
+        tk.Label(logo_frame, text="FlowCheck",
+                 font=_FT_H1, bg=_WHITE, fg=_TEXT).pack(anchor="w")
+        tk.Label(logo_frame,
                  text="Confronta automaticamente due versioni di file CSV o ZIP",
-                 font=_F_SUB, bg=_HEADER_BG, fg="#A8C4E0").pack(
-            side="left", padx=(4, 0), pady=(0, 4), anchor="sw")
+                 font=_FT_XS, bg=_WHITE, fg=_TEXT_MUTED).pack(anchor="w")
 
-        # ── Scroll contenitore principale ─────────────────────────────
-        outer = tk.Frame(self, bg=_BG)
-        outer.pack(fill="both", expand=True, padx=18, pady=14)
-        outer.columnconfigure(0, weight=1)
+        # Badge versione
+        badge = tk.Frame(inner, bg=_PRIMARY_LT, padx=10, pady=4)
+        badge.pack(side="right", anchor="n")
+        tk.Label(badge, text="v2.0", font=("Segoe UI", 8, "bold"),
+                 bg=_PRIMARY_LT, fg=_PRIMARY).pack()
 
-        row = 0
+    def _build_body(self, parent: tk.Frame):
+        pad = dict(padx=24, pady=8)
 
-        # ── Card 1: Scegli i file ─────────────────────────────────────
-        f_outer, f_inner = _card(outer, padx=16, pady=6)
-        f_outer.grid(row=row, column=0, sticky="ew")
-        outer.rowconfigure(row, weight=0)
-        row += 1
+        # ── Card 1: File ──────────────────────────────────────────────
+        sh, card = _card(parent)
+        sh.pack(fill="x", **pad)
+        _card_header(card, "📂", "Carica i file")
 
-        tk.Label(f_inner, text="1  Scegli i file", font=("Segoe UI", 11, "bold"),
-                 bg=_CARD, fg=_HEADER_BG).pack(anchor="w", pady=(6, 0))
-
-        # AS-IS
-        _section_label(f_inner, "Versione attuale  (AS-IS)")
+        _field_label(card, "Versione attuale  (AS-IS)")
         self._asis_var = tk.StringVar()
-        self._build_file_row(f_inner, self._asis_var)
-        _hint(f_inner, "File CSV, archivio ZIP o cartella contenente i dati di partenza")
+        self._build_file_row(card, self._asis_var)
+        _hint_label(card, "File CSV, archivio ZIP o cartella con i dati di partenza")
 
-        # Separatore visivo
-        tk.Frame(f_inner, bg=_BORDER, height=1).pack(fill="x", pady=4)
+        _divider(card)
 
-        # TO-BE
-        _section_label(f_inner, "Nuova versione  (TO-BE)")
+        _field_label(card, "Nuova versione  (TO-BE)")
         self._tobe_var = tk.StringVar()
-        self._build_file_row(f_inner, self._tobe_var)
-        _hint(f_inner, "File CSV, archivio ZIP o cartella con i nuovi dati da confrontare")
+        self._build_file_row(card, self._tobe_var)
+        _hint_label(card, "File CSV, archivio ZIP o cartella con i nuovi dati da confrontare")
 
-        # Separatore visivo
-        tk.Frame(f_inner, bg=_BORDER, height=1).pack(fill="x", pady=4)
+        _divider(card)
 
-        # Output
-        _section_label(f_inner, "Dove salvare i risultati  (facoltativo)")
-        out_row = tk.Frame(f_inner, bg=_CARD)
+        _field_label(card, "Dove salvare i risultati  (facoltativo)")
+        out_row = tk.Frame(card, bg=_CARD)
         out_row.pack(fill="x")
         self._out_var = tk.StringVar()
         ttk.Entry(out_row, textvariable=self._out_var,
-                  font=_F_LABEL).pack(side="left", fill="x", expand=True, padx=(0, 8))
-        ttk.Button(out_row, text="📁  Sfoglia",
-                   command=lambda: self._browse_dir(self._out_var)).pack(side="left")
-        _hint(f_inner, "Se non indicato, i file vengono salvati nella stessa cartella dell'AS-IS")
+                  style="FC.TEntry", font=_FT).pack(
+            side="left", fill="x", expand=True, padx=(0, 10))
+        _icon_button(out_row, "📁", "Sfoglia",
+                     lambda: self._browse_dir(self._out_var),
+                     "secondary").pack(side="left")
+        _hint_label(card,
+            "Lascia vuoto per salvare nella stessa cartella dell'AS-IS")
 
-        # ── Pannello avanzate (toggle) ─────────────────────────────────
-        adv_toggle_row = tk.Frame(outer, bg=_BG)
-        adv_toggle_row.grid(row=row, column=0, sticky="ew", pady=(8, 0))
-        row += 1
+        # ── Toggle avanzate ───────────────────────────────────────────
+        tgl_frame = tk.Frame(parent, bg=_BG)
+        tgl_frame.pack(fill="x", padx=24, pady=(0, 4))
 
         self._adv_btn = tk.Button(
-            adv_toggle_row,
-            text="▶  Impostazioni avanzate  (separatore, chiave di collegamento)",
-            font=_F_HINT, bg=_BG, fg=_PRIMARY, relief="flat",
-            cursor="hand2", activebackground=_BG, activeforeground=_PRIMARY_HO,
+            tgl_frame,
+            text="▶   Impostazioni avanzate  —  separatore e chiave di collegamento",
+            font=("Segoe UI", 9), bg=_BG, fg=_TEXT_SEC,
+            relief="flat", cursor="hand2", anchor="w",
+            activebackground=_BG, activeforeground=_PRIMARY,
+            padx=0, pady=4,
             command=self._toggle_advanced,
         )
-        self._adv_btn.pack(anchor="w")
+        self._adv_btn.pack(side="left")
+        self._adv_btn.bind("<Enter>", lambda _: self._adv_btn.config(fg=_PRIMARY))
+        self._adv_btn.bind("<Leave>", lambda _: self._adv_btn.config(fg=_TEXT_SEC))
 
-        # Card opzioni avanzate (nascosta di default)
-        self._adv_outer, self._adv_inner = _card(outer, padx=16, pady=8)
-        # NON grid: viene mostrata/nascosta da _toggle_advanced
-        self._adv_row = row          # riga da usare se visible
-        row += 1
+        # ── Card avanzate (nascosta) ───────────────────────────────────
+        self._adv_shadow, self._adv_card = _card(parent)
+        self._build_advanced(self._adv_card)
+        self._adv_row_widget = self._adv_shadow   # per show/hide
 
-        self._build_advanced(self._adv_inner)
+        # ── Card azioni ───────────────────────────────────────────────
+        act_sh, act_card = _card(parent, padx=18, pady=14)
+        act_sh.pack(fill="x", padx=24, pady=(4, 0))
+        self._build_actions(act_card)
 
-        # ── Bottoni azione ─────────────────────────────────────────────
-        btn_card_outer, btn_card = _card(outer, padx=16, pady=10)
-        btn_card_outer.grid(row=row, column=0, sticky="ew", pady=(10, 0))
-        row += 1
+        # ── Card avanzamento ──────────────────────────────────────────
+        prog_sh, prog_card = _card(parent, padx=18, pady=12)
+        prog_sh.pack(fill="x", padx=24, pady=(8, 0))
+        self._build_progress(prog_card)
 
-        btn_left = tk.Frame(btn_card, bg=_CARD)
-        btn_left.pack(side="left", fill="x", expand=True)
+        # ── Card log ──────────────────────────────────────────────────
+        log_sh, log_card = _card(parent, padx=0, pady=0)
+        log_sh.pack(fill="both", expand=True, padx=24, pady=(8, 16))
+        self._build_log(log_card)
 
-        self._run_btn = tk.Button(
-            btn_left,
-            text="▶   Avvia confronto",
-            font=_F_BTN, bg=_PRIMARY, fg=_WHITE,
-            activebackground=_PRIMARY_HO, activeforeground=_WHITE,
-            relief="flat", padx=22, pady=8, cursor="hand2",
-            command=self._start_comparison,
-        )
-        self._run_btn.pack(side="left")
-
-        self._open_btn = tk.Button(
-            btn_left,
-            text="📂  Apri risultati",
-            font=_F_LABEL, bg=_BG, fg=_TEXT,
-            activebackground="#E2E8F0", relief="flat",
-            padx=14, pady=8, cursor="hand2", state="disabled",
-            command=self._open_output_folder,
-        )
-        self._open_btn.pack(side="left", padx=10)
-
-        self._clear_btn = tk.Button(
-            btn_left,
-            text="✕  Pulisci log",
-            font=_F_HINT, bg=_BG, fg=_MUTED,
-            activebackground="#E2E8F0", relief="flat",
-            padx=10, pady=8, cursor="hand2",
-            command=self._clear_log,
-        )
-        self._clear_btn.pack(side="right")
-
-        # ── Barra avanzamento ──────────────────────────────────────────
-        prog_outer, prog_inner = _card(outer, padx=14, pady=10)
-        prog_outer.grid(row=row, column=0, sticky="ew", pady=(8, 0))
-        row += 1
-
-        # Intestazione card
-        prog_hdr = tk.Frame(prog_inner, bg=_CARD)
-        prog_hdr.pack(fill="x", pady=(0, 6))
-        tk.Label(prog_hdr, text="Avanzamento", font=("Segoe UI", 9, "bold"),
-                 bg=_CARD, fg=_TEXT).pack(side="left")
-        self._prog_pct_label = tk.Label(prog_hdr, text="", font=("Segoe UI", 9, "bold"),
-                                        bg=_CARD, fg=_PRIMARY)
-        self._prog_pct_label.pack(side="right")
-
-        # Barra
-        s = ttk.Style()
-        s.configure("fc.Horizontal.TProgressbar",
-                    troughcolor="#E2E8F0", background=_PRIMARY,
-                    thickness=16)
-        s.configure("fc_done.Horizontal.TProgressbar",
-                    troughcolor="#E2E8F0", background=_SUCCESS,
-                    thickness=16)
-        self._prog_var = tk.DoubleVar(value=0)
-        self._progressbar = ttk.Progressbar(
-            prog_inner, variable=self._prog_var,
-            maximum=100, mode="determinate",
-            style="fc.Horizontal.TProgressbar",
-        )
-        self._progressbar.pack(fill="x", pady=(0, 8))
-
-        # Riga info: file corrente + timer
-        info_row = tk.Frame(prog_inner, bg=_CARD)
-        info_row.pack(fill="x")
-
-        self._prog_file_label = tk.Label(
-            info_row, text="", font=_F_HINT, bg=_CARD,
-            fg=_TEXT, anchor="w",
-        )
-        self._prog_file_label.pack(side="left")
-
-        self._prog_time_label = tk.Label(
-            info_row, text="", font=("Consolas", 9),
-            bg=_CARD, fg=_MUTED, anchor="e",
-        )
-        self._prog_time_label.pack(side="right")
-
-        # Stato interno timer
-        self._prog_t_run_start: float | None = None
-        self._prog_t_file_start: float | None = None
-        self._prog_timer_id: str | None = None
-        self._prog_total = 1
-        self._prog_done  = 0
-
-        # ── Log ────────────────────────────────────────────────────────
-        log_outer, log_inner = _card(outer, padx=0, pady=0)
-        log_outer.grid(row=row, column=0, sticky="nsew", pady=(10, 0))
-        outer.rowconfigure(row, weight=1)
-        row += 1
-
-        log_hdr = tk.Frame(log_inner, bg="#161B22", height=28)
-        log_hdr.pack(fill="x")
-        log_hdr.pack_propagate(False)
-        tk.Label(log_hdr, text="  Registro elaborazione",
-                 font=_F_HINT, bg="#161B22", fg="#8B949E",
-                 anchor="w").pack(fill="both", expand=True, padx=4)
-
-        self._log = ScrolledText(
-            log_inner, font=_F_MONO, bg="#0D1117", fg="#C9D1D9",
-            insertbackground="white", relief="flat",
-            wrap="word", state="disabled", height=10,
-        )
-        self._log.pack(fill="both", expand=True)
-
-        for tag, color in [("ok",   "#3FB950"), ("err",  "#F85149"),
-                           ("warn", "#D29922"), ("info", "#58A6FF"),
-                           ("dim",  "#8B949E")]:
-            self._log.tag_configure(tag, foreground=color)
-
-        # ── Status bar ─────────────────────────────────────────────────
-        self._status_var = tk.StringVar(value="✔  Pronto")
-        tk.Label(self, textvariable=self._status_var,
-                 font=_F_HINT, bg=_HEADER_BG, fg="#A8C4E0",
-                 anchor="w", padx=14).pack(fill="x", side="bottom")
-
-    # ------------------------------------------------------------------
-    # File row helper
-    # ------------------------------------------------------------------
+    # ── Componenti sezione ───────────────────────────────────────────────────
 
     def _build_file_row(self, parent: tk.Frame, var: tk.StringVar):
         row = tk.Frame(parent, bg=_CARD)
         row.pack(fill="x", pady=(0, 2))
-        ttk.Entry(row, textvariable=var,
-                  font=_F_LABEL).pack(side="left", fill="x", expand=True, padx=(0, 8))
-        ttk.Button(row, text="📄  File / ZIP",
-                   command=lambda: self._browse_file(var)).pack(side="left", padx=(0, 4))
-        ttk.Button(row, text="📁  Cartella",
-                   command=lambda: self._browse_dir(var)).pack(side="left")
-
-    # ------------------------------------------------------------------
-    # Pannello avanzate
-    # ------------------------------------------------------------------
+        ttk.Entry(row, textvariable=var, style="FC.TEntry",
+                  font=_FT).pack(side="left", fill="x", expand=True, padx=(0, 10))
+        _icon_button(row, "📄", "File / ZIP",
+                     lambda: self._browse_file(var), "secondary").pack(
+            side="left", padx=(0, 6))
+        _icon_button(row, "📁", "Cartella",
+                     lambda: self._browse_dir(var), "secondary").pack(side="left")
 
     def _build_advanced(self, parent: tk.Frame):
-        tk.Label(parent, text="Impostazioni avanzate", font=("Segoe UI", 10, "bold"),
-                 bg=_CARD, fg=_HEADER_BG).pack(anchor="w", pady=(4, 8))
+        _card_header(parent, "⚙", "Impostazioni avanzate",
+                     "— modifica solo se il rilevamento automatico non funziona")
 
         # Separatore
-        sep_frame = tk.Frame(parent, bg=_CARD)
-        sep_frame.pack(fill="x", pady=(0, 4))
-
-        tk.Label(sep_frame, text="Separatore campi:", font=_F_LABEL,
-                 bg=_CARD, fg=_TEXT, width=22, anchor="w").pack(side="left")
+        row1 = tk.Frame(parent, bg=_CARD)
+        row1.pack(fill="x", pady=(0, 4))
+        tk.Label(row1, text="Separatore campi:", font=_FT_H3,
+                 bg=_CARD, fg=_TEXT_SEC, width=20, anchor="w").pack(side="left")
 
         self._sep_combo_var = tk.StringVar(value=SEP_OPTIONS[0][0])
-        sep_cb = ttk.Combobox(sep_frame, textvariable=self._sep_combo_var,
+        sep_cb = ttk.Combobox(row1, textvariable=self._sep_combo_var,
                               values=[o[0] for o in SEP_OPTIONS],
-                              state="readonly", width=26, font=_F_LABEL)
-        sep_cb.pack(side="left", padx=(0, 10))
+                              state="readonly", width=28,
+                              style="FC.TCombobox", font=_FT)
+        sep_cb.pack(side="left", padx=(0, 12))
         sep_cb.bind("<<ComboboxSelected>>", self._on_sep_change)
 
         self._sep_custom_var = tk.StringVar()
-        self._sep_custom_entry = ttk.Entry(sep_frame, textvariable=self._sep_custom_var,
-                                           width=8, font=_F_LABEL, state="disabled")
+        self._sep_custom_entry = ttk.Entry(
+            row1, textvariable=self._sep_custom_var,
+            width=8, style="FC.TEntry", font=_FT, state="disabled")
         self._sep_custom_entry.pack(side="left")
-        tk.Label(sep_frame, text="← solo per «Personalizzato»",
-                 font=_F_HINT, bg=_CARD, fg=_MUTED).pack(side="left", padx=6)
+        tk.Label(row1, text=" ← solo per «Personalizzato»",
+                 font=_FT_XS, bg=_CARD, fg=_TEXT_MUTED).pack(side="left")
 
-        _hint(parent,
-              "Di solito il rilevamento automatico funziona correttamente. "
-              "Cambia solo se i dati vengono letti in modo errato.")
-
-        tk.Frame(parent, bg=_BORDER, height=1).pack(fill="x", pady=6)
+        _divider(parent)
 
         # Chiave di collegamento
-        jk_label_row = tk.Frame(parent, bg=_CARD)
-        jk_label_row.pack(fill="x", pady=(0, 4))
-        tk.Label(jk_label_row, text="Chiave di collegamento:", font=_F_LABEL,
-                 bg=_CARD, fg=_TEXT, width=22, anchor="w").pack(side="left")
+        row2 = tk.Frame(parent, bg=_CARD)
+        row2.pack(fill="x")
+        tk.Label(row2, text="Chiave di collegamento:", font=_FT_H3,
+                 bg=_CARD, fg=_TEXT_SEC, width=20, anchor="w").pack(side="left")
 
         self._jk_mode_var = tk.StringVar(value="auto")
-
-        tk.Radiobutton(jk_label_row, text="Automatica",
+        tk.Radiobutton(row2, text="Automatica",
                        variable=self._jk_mode_var, value="auto",
-                       bg=_CARD, font=_F_LABEL,
+                       bg=_CARD, font=_FT, fg=_TEXT_SEC,
+                       selectcolor=_WHITE, activebackground=_CARD,
                        command=self._on_jk_mode_change).pack(side="left")
-        tk.Radiobutton(jk_label_row, text="Personalizzata:",
+        tk.Radiobutton(row2, text="Personalizzata:",
                        variable=self._jk_mode_var, value="manual",
-                       bg=_CARD, font=_F_LABEL,
+                       bg=_CARD, font=_FT, fg=_TEXT_SEC,
+                       selectcolor=_WHITE, activebackground=_CARD,
                        command=self._on_jk_mode_change).pack(side="left", padx=(14, 0))
 
         self._jk_var = tk.StringVar()
-        self._jk_entry = ttk.Entry(jk_label_row, textvariable=self._jk_var,
-                                   width=32, font=_F_LABEL, state="disabled")
-        self._jk_entry.pack(side="left", padx=(4, 8))
+        self._jk_entry = ttk.Entry(row2, textvariable=self._jk_var,
+                                   width=30, style="FC.TEntry", font=_FT,
+                                   state="disabled")
+        self._jk_entry.pack(side="left", padx=(6, 0))
 
-        _hint(parent,
-              "Campo (o campi separati da virgola) usato per abbinare le righe tra i due file.  "
-              "Es.: POLIZZA   oppure   POLIZZA,TIPO_MOV")
+        _hint_label(parent,
+            "Campo (o campi separati da virgola) usato per abbinare le righe.  "
+            "Es.: POLIZZA   oppure   POLIZZA,TIPO_MOV")
 
-    # ------------------------------------------------------------------
-    # Toggle pannello avanzate
-    # ------------------------------------------------------------------
+    def _build_actions(self, parent: tk.Frame):
+        left = tk.Frame(parent, bg=_CARD)
+        left.pack(fill="x")
+
+        self._run_btn = _icon_button(
+            left, "▶", "Avvia confronto",
+            self._start_comparison, "primary")
+        self._run_btn.pack(side="left")
+
+        self._open_btn = _icon_button(
+            left, "📂", "Apri risultati",
+            self._open_output_folder, "secondary")
+        self._open_btn.configure(state="disabled")
+        self._open_btn.pack(side="left", padx=(10, 0))
+
+        self._clear_btn = _icon_button(
+            left, "✕", "Pulisci log",
+            self._clear_log, "ghost")
+        self._clear_btn.pack(side="right")
+
+    def _build_progress(self, parent: tk.Frame):
+        # Riga superiore: titolo + percentuale
+        top = tk.Frame(parent, bg=_CARD)
+        top.pack(fill="x", pady=(0, 6))
+
+        tk.Label(top, text="Avanzamento", font=_FT_H3,
+                 bg=_CARD, fg=_TEXT_SEC).pack(side="left")
+        self._prog_pct_label = tk.Label(
+            top, text="", font=("Segoe UI", 9, "bold"),
+            bg=_CARD, fg=_PRIMARY)
+        self._prog_pct_label.pack(side="right")
+
+        # Barra
+        self._prog_var = tk.DoubleVar(value=0)
+        self._progressbar = ttk.Progressbar(
+            parent, variable=self._prog_var,
+            maximum=100, mode="determinate",
+            style="FC.Horizontal.TProgressbar")
+        self._progressbar.pack(fill="x", pady=(0, 6))
+
+        # Riga inferiore: file corrente + timer
+        bot = tk.Frame(parent, bg=_CARD)
+        bot.pack(fill="x")
+        self._prog_file_label = tk.Label(
+            bot, text="In attesa…", font=_FT_XS, bg=_CARD, fg=_TEXT_MUTED, anchor="w")
+        self._prog_file_label.pack(side="left")
+        self._prog_time_label = tk.Label(
+            bot, text="", font=_FT_M, bg=_CARD, fg=_TEXT_MUTED, anchor="e")
+        self._prog_time_label.pack(side="right")
+
+    def _build_log(self, parent: tk.Frame):
+        # Header del log
+        log_hdr = tk.Frame(parent, bg="#1B2333", pady=6)
+        log_hdr.pack(fill="x")
+        tk.Label(log_hdr, text="  📋  Registro elaborazione",
+                 font=("Segoe UI", 9, "bold"),
+                 bg="#1B2333", fg="#8B949E").pack(side="left")
+
+        self._log = ScrolledText(
+            parent, font=_FT_M,
+            bg="#161B27", fg="#CDD6F4",
+            insertbackground="#CDD6F4",
+            selectbackground="#2D4F7C",
+            relief="flat", wrap="word",
+            state="disabled", height=12,
+            padx=14, pady=10,
+        )
+        self._log.pack(fill="both", expand=True)
+
+        for tag, col in [
+            ("ok",   "#A6E3A1"),
+            ("err",  "#F38BA8"),
+            ("warn", "#F9E2AF"),
+            ("info", "#89B4FA"),
+            ("dim",  "#6C7086"),
+        ]:
+            self._log.tag_configure(tag, foreground=col)
+
+    # ── Toggle avanzate ────────────────────────────────────────────────────
 
     def _toggle_advanced(self):
         self._adv_visible = not self._adv_visible
         if self._adv_visible:
-            self._adv_outer.grid(row=self._adv_row, column=0,
-                                 sticky="ew", pady=(4, 0))
-            self._adv_btn.configure(
-                text="▼  Impostazioni avanzate  (separatore, chiave di collegamento)")
+            self._adv_row_widget.pack(fill="x", padx=24, pady=(0, 4))
+            self._adv_btn.config(
+                text="▼   Impostazioni avanzate  —  separatore e chiave di collegamento")
         else:
-            self._adv_outer.grid_remove()
-            self._adv_btn.configure(
-                text="▶  Impostazioni avanzate  (separatore, chiave di collegamento)")
+            self._adv_row_widget.pack_forget()
+            self._adv_btn.config(
+                text="▶   Impostazioni avanzate  —  separatore e chiave di collegamento")
 
-    # ------------------------------------------------------------------
-    # Helpers UI
-    # ------------------------------------------------------------------
+    # ── Event handler ─────────────────────────────────────────────────────
 
     def _browse_file(self, var: tk.StringVar):
         p = filedialog.askopenfilename(
@@ -425,7 +498,7 @@ class FlowCheckApp(tk.Tk):
         if p:
             var.set(p)
 
-    def _on_sep_change(self, _event=None):
+    def _on_sep_change(self, _e=None):
         if self._sep_combo_var.get().startswith("Personalizzato"):
             self._sep_custom_entry.configure(state="normal")
             self._sep_custom_entry.focus()
@@ -453,78 +526,71 @@ class FlowCheckApp(tk.Tk):
     def _get_join_key(self) -> list[str] | None:
         if self._jk_mode_var.get() != "manual":
             return None
-        raw = self._jk_var.get().strip()
-        cols = [c.strip() for c in raw.split(",") if c.strip()]
-        return cols if cols else None
+        cols = [c.strip() for c in self._jk_var.get().split(",") if c.strip()]
+        return cols or None
 
-    # ------------------------------------------------------------------
-    # Log
-    # ------------------------------------------------------------------
+    # ── Log ───────────────────────────────────────────────────────────────
 
     def _log_write(self, msg: str):
-
-        # ── [FILE_START] N/M label ─────────────────────────────────────
+        # ── Messaggi strutturati (non scrivono nel log testuale) ──────────
         if msg.startswith("[FILE_START]"):
             try:
-                _, progress, *label_parts = msg.split()   # [FILE_START] 2/10 NOME
-                done_str, total_str = progress.split("/")
-                done  = int(done_str)
-                total = int(total_str)
-                label = " ".join(label_parts)
-                self._prog_total       = total
-                self._prog_done        = done - 1          # non ancora completato
+                _, progress, *parts = msg.split()
+                done_n, total_n = map(int, progress.split("/"))
+                label = " ".join(parts)
+                self._prog_total        = total_n
+                self._prog_done         = done_n - 1
                 self._prog_t_file_start = time.perf_counter()
-                # Barra indeterminate per segnalare "in lavorazione"
                 self._progressbar.stop()
                 self._progressbar.configure(
-                    mode="indeterminate", style="fc.Horizontal.TProgressbar")
-                self._progressbar.start(12)
-                pct_done = ((done - 1) / total * 100) if total else 0
+                    mode="indeterminate",
+                    style="FC.Horizontal.TProgressbar")
+                self._progressbar.start(10)
+                pct_done = ((done_n - 1) / total_n * 100) if total_n else 0
                 self._prog_pct_label.configure(
-                    text=f"File {done} di {total}  ({pct_done:.0f}% completato)",
+                    text=f"File {done_n} di {total_n}  ({pct_done:.0f}%)",
                     fg=_PRIMARY)
                 self._prog_file_label.configure(
-                    text=f"▶  In elaborazione:  {label}")
+                    text=f"▶  {label}")
             except Exception:
                 pass
             return
 
-        # ── [PROGRESS] done/total ──────────────────────────────────────
         if msg.startswith("[PROGRESS]"):
             try:
                 _, progress = msg.split()
                 done, total = map(int, progress.split("/"))
                 self._prog_done  = done
                 self._prog_total = total
-                # Ferma indeterminate, passa a determinate
                 self._progressbar.stop()
                 pct = (done / total * 100) if total else 100
-                self._progressbar.configure(
-                    mode="determinate", style="fc.Horizontal.TProgressbar")
+                style = "FCDone.Horizontal.TProgressbar" if done == total \
+                        else "FC.Horizontal.TProgressbar"
+                self._progressbar.configure(mode="determinate", style=style)
                 self._prog_var.set(pct)
                 self._prog_pct_label.configure(
                     text=f"File {done} di {total}  ({pct:.0f}%)",
-                    fg=_PRIMARY)
-                if done == total:
-                    self._prog_file_label.configure(text="")
-                else:
-                    self._prog_file_label.configure(
-                        text=f"✔  File completato  —  {total - done} rimasti")
+                    fg=_SUCCESS if done == total else _PRIMARY)
+                self._prog_file_label.configure(
+                    text="" if done == total
+                    else f"✔  Completato  —  {total - done} rimasti")
             except Exception:
                 pass
-            return          # non scrivere nel log testuale
+            return
 
+        # ── Log testuale ─────────────────────────────────────────────────
         self._log.configure(state="normal")
-        ml = msg.lower()
-        tag = None
-        if "[ok]" in ml:                                   tag = "ok"
-        elif "[errore]" in ml or "traceback" in ml:        tag = "err"
-        elif "[attenzione]" in ml or "[skip]" in ml:       tag = "warn"
-        elif msg.startswith("AS-IS") or msg.startswith("TO-BE") \
-             or msg.startswith("Cop") or msg.startswith("Chi"):
+        ml  = msg.lower()
+        tag = ""
+        if "[ok]" in ml:                                tag = "ok"
+        elif "[errore]" in ml or "traceback" in ml:     tag = "err"
+        elif "[attenzione]" in ml or "[skip]" in ml:    tag = "warn"
+        elif (msg.startswith("AS-IS") or msg.startswith("TO-BE")
+              or msg.startswith("Cop") or msg.startswith("Chi")):
             tag = "info"
-        elif msg.startswith("  ") or msg.startswith("---"): tag = "dim"
-        self._log.insert("end", msg + "\n", tag or "")
+        elif msg.startswith("  ") or msg.startswith("---"):
+            tag = "dim"
+        self._log.insert("end", msg + "\n", tag)
         self._log.see("end")
         self._log.configure(state="disabled")
 
@@ -540,80 +606,76 @@ class FlowCheckApp(tk.Tk):
             else:
                 subprocess.Popen(["xdg-open", self._last_output_dir])
 
-    # ------------------------------------------------------------------
-    # Stato bottone principale
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Timer live
-    # ------------------------------------------------------------------
+    # ── Timer live ─────────────────────────────────────────────────────────
 
     @staticmethod
     def _fmt(secs: float) -> str:
         secs = max(0.0, secs)
         if secs < 60:
-            return f"{secs:4.0f}s"
+            return f"{secs:.0f}s"
         m, s = divmod(int(secs), 60)
         return f"{m}m {s:02d}s"
 
     def _tick_timer(self):
-        """Aggiorna etichetta elapsed ogni 500 ms finché il run è attivo."""
         if not self._running:
             return
-        import time
-        now = time.perf_counter()
+        now    = time.perf_counter()
         t_run  = now - self._prog_t_run_start  if self._prog_t_run_start  else 0.0
         t_file = now - self._prog_t_file_start if self._prog_t_file_start else 0.0
         self._prog_time_label.configure(
-            text=f"⏱  file {self._fmt(t_file)}  |  totale {self._fmt(t_run)}")
+            text=f"⏱  file {self._fmt(t_file)}  ·  totale {self._fmt(t_run)}")
         self._prog_timer_id = self.after(500, self._tick_timer)
 
-    # ------------------------------------------------------------------
-    # Stato bottone principale
-    # ------------------------------------------------------------------
+    # ── Stato run ──────────────────────────────────────────────────────────
 
     def _set_running(self, running: bool):
         self._running = running
         if running:
             self._run_btn.configure(
-                state="disabled", text="⏳  Elaborazione in corso…",
-                bg="#6B9BD2", fg=_WHITE)
-            self._status_var.set("⏳  Elaborazione in corso…")
-            # Reset avanzamento
+                state="disabled",
+                text="  ⏳  Elaborazione in corso…  ",
+                bg="#94B8E8", fg=_WHITE)
+            self._run_btn.unbind("<Enter>")
+            self._run_btn.unbind("<Leave>")
+            self._status_var.set("Elaborazione in corso…")
+            # Reset progress
             self._prog_var.set(0)
-            self._prog_pct_label.configure(text="")
+            self._prog_pct_label.configure(text="", fg=_PRIMARY)
             self._prog_file_label.configure(text="Avvio…")
             self._prog_time_label.configure(text="")
             self._progressbar.configure(
-                mode="indeterminate", style="fc.Horizontal.TProgressbar")
-            self._progressbar.start(12)
-            # Avvia timer live
+                mode="indeterminate",
+                style="FC.Horizontal.TProgressbar")
+            self._progressbar.start(10)
+            # Timer
             self._prog_t_run_start  = time.perf_counter()
             self._prog_t_file_start = time.perf_counter()
-            self._prog_done  = 0
-            self._prog_total = 1
-            self._prog_timer_id = self.after(500, self._tick_timer)
+            self._prog_timer_id     = self.after(500, self._tick_timer)
         else:
-            # Ferma timer e animazione
             if self._prog_timer_id:
                 self.after_cancel(self._prog_timer_id)
                 self._prog_timer_id = None
             self._progressbar.stop()
             self._progressbar.configure(
-                mode="determinate", style="fc_done.Horizontal.TProgressbar")
+                mode="determinate",
+                style="FCDone.Horizontal.TProgressbar")
             self._prog_var.set(100)
             self._prog_pct_label.configure(text="Completato ✔", fg=_SUCCESS)
             self._prog_file_label.configure(text="")
+            # Ripristina bottone con hover
             self._run_btn.configure(
-                state="normal", text="▶   Avvia confronto",
+                state="normal",
+                text="  ▶  Avvia confronto  ",
                 bg=_PRIMARY, fg=_WHITE)
+            self._run_btn.bind("<Enter>",
+                lambda _: self._run_btn.config(bg=_PRIMARY_DK))
+            self._run_btn.bind("<Leave>",
+                lambda _: self._run_btn.config(bg=_PRIMARY))
             self._status_var.set("✔  Completato")
             if self._last_output_dir:
                 self._open_btn.configure(state="normal")
 
-    # ------------------------------------------------------------------
-    # Avvio confronto
-    # ------------------------------------------------------------------
+    # ── Avvio confronto ────────────────────────────────────────────────────
 
     def _start_comparison(self):
         asis     = self._asis_var.get().strip()
@@ -625,12 +687,12 @@ class FlowCheckApp(tk.Tk):
         if not asis:
             messagebox.showwarning(
                 "File mancante",
-                "Seleziona il file (o la cartella) con la versione attuale (AS-IS).")
+                "Seleziona il file (o cartella) con la versione attuale (AS-IS).")
             return
         if not tobe:
             messagebox.showwarning(
                 "File mancante",
-                "Seleziona il file (o la cartella) con la nuova versione (TO-BE).")
+                "Seleziona il file (o cartella) con la nuova versione (TO-BE).")
             return
 
         self._clear_log()
@@ -658,16 +720,14 @@ class FlowCheckApp(tk.Tk):
             )
             if out is None and generated:
                 self._last_output_dir = str(Path(generated[0]).parent)
-            self._q.put(None)
         except Exception as exc:
             import traceback
             self._q.put(f"[ERRORE] {exc}")
             self._q.put(traceback.format_exc())
+        finally:
             self._q.put(None)
 
-    # ------------------------------------------------------------------
-    # Poll coda messaggi (thread-safe)
-    # ------------------------------------------------------------------
+    # ── Poll coda ──────────────────────────────────────────────────────────
 
     def _poll_queue(self):
         try:
@@ -682,9 +742,9 @@ class FlowCheckApp(tk.Tk):
         self.after(100, self._poll_queue)
 
 
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Entry point
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 
 def main():
     app = FlowCheckApp()
