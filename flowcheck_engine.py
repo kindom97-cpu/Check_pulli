@@ -364,6 +364,8 @@ def read_csv(filepath: str | Path, sep: str | None = None) -> pd.DataFrame:
         keep_default_na=False,
         on_bad_lines="skip",
         engine=engine,
+        index_col=False,   # evita che pandas usi col 0 come indice quando i dati
+                           # hanno un campo più dell'intestazione (trailing sep)
     )
     # Quando non c'e' header pandas assegna interi (0, 1, 2…);
     # li rinominiamo in Col_1, Col_2, … prima di ogni altro processing.
@@ -425,6 +427,8 @@ def read_csv_from_zip(zip_path: str | Path, csv_name: str, sep: str | None = Non
         keep_default_na=False,
         on_bad_lines="skip",
         engine=engine,
+        index_col=False,   # evita che pandas usi col 0 come indice quando i dati
+                           # hanno un campo più dell'intestazione (trailing sep)
     )
     # Quando non c'e' header pandas assegna interi (0, 1, 2…);
     # li rinominiamo in Col_1, Col_2, … prima di ogni altro processing.
@@ -1140,6 +1144,7 @@ def _iter_csv_chunks(
                 on_bad_lines="skip",
                 keep_default_na=False,
                 skipinitialspace=True,
+                index_col=False,   # evita shift quando i dati hanno trailing sep
             )
             col_names: list[str] = []
             for i, chunk in enumerate(reader):
