@@ -1187,47 +1187,182 @@ def _load_to_duckdb(
     sep: str,
     db_path: str,
     table: str,
-    chunk_size: int = 100_000,
+    chunk_size: int = 100_000,      # non usato (mantenuto per compatibilità firma)
     log_cb: Callable[[str], None] | None = None,
     row_filter: "dict[str, str] | None" = None,
 ) -> tuple[list[str], int]:
     """
-    Carica un CSV (o ZIP entry) in una tabella DuckDB su file, a blocchi.
-    Ogni chiamata usa una connessione DuckDB dedicata (thread-safe).
-    Aggiunge la colonna sentinella _fc_exists=1 per rilevare LEFT JOIN miss.
-    Restituisce (nomi_colonne_normalizzati, n_righe_totali).
+    Carica CSV (o ZIP entry) in DuckDB usando il reader nativo C++ multi-thread.
+
+    Strategia:
+    - ZIP  → estrae prima il CSV su file temporaneo (decompressione via C zlib,
+              non Python), poi usa DuckDB per leggere il file locale.
+    - CSV  → DuckDB legge direttamente con read_csv() (C++, parallel=true).
+
+    Vantaggi rispetto a pandas chunking:
+    - Nessun overhead Python per la decompressione ZIP
+    - DuckDB usa tutti i core CPU (SIMD, multi-thread)
+    - sep multi-char (';£', ';#') → usa il primo char come delimitatore;
+      i prefissi vengono rimossi con LTRIM in SQL (no pandas engine=python)
+    - row_filter applicato come WHERE push-down nello scan (no lettura righe inutili)
     """
     import duckdb as _duckdb
-    conn   = _duckdb.connect(db_path)
-    total  = 0
-    col_names: list[str] = []
-    first  = True
+    import tempfile as _tf
+    import shutil as _sh
+
+    def _log(m):
+        if log_cb:
+            log_cb(m)
+
+    tmp_csv: "str | None" = None
+
+    # ── 1. ZIP → file temporaneo ───────────────────────────────────────────────
+    if "::" in path_str:
+        zp, ze = path_str.split("::", 1)
+        fd, tmp_csv = _tf.mkstemp(suffix=".csv", prefix="flowcheck_csv_")
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(zp) as zf:
+                sz_mb = zf.getinfo(ze).file_size / 1024 / 1024
+                _log(f"    {table.upper()}: estrazione ZIP → {sz_mb:,.0f} MB (file non compresso)...")
+                with zf.open(ze) as src, open(tmp_csv, "wb") as dst:
+                    _sh.copyfileobj(src, dst, length=16 << 20)   # buffer 16 MB
+        except Exception:
+            try:
+                os.unlink(tmp_csv)
+            except OSError:
+                pass
+            raise
+        actual = tmp_csv
+        _log(f"    {table.upper()}: estrazione completata — avvio DuckDB reader...")
+    else:
+        actual = path_str
 
     try:
-        for cols, chunk in _iter_csv_chunks(path_str, sep, chunk_size):
-            if not col_names:
-                col_names = cols
-            if row_filter:
-                for _fc, _fv in row_filter.items():
-                    if _fc in chunk.columns:
-                        chunk = chunk[chunk[_fc].str.strip() == _fv.strip()]
-                if chunk.empty:
-                    continue
-            chunk["_fc_exists"] = 1   # sentinella per LEFT JOIN IS NULL
-            if first:
-                conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM chunk')
-                first = False
-            else:
-                conn.execute(f'INSERT INTO "{table}" SELECT * FROM chunk')
-            total += len(chunk)
-            if log_cb and total % (chunk_size * 4) < chunk_size:
-                log_cb(f"    {table.upper()}: {total:,} righe caricate...")
-    finally:
-        conn.close()
+        # ── 2. Rileva encoding e header ────────────────────────────────────────
+        with open(actual, "rb") as f:
+            hdr_bytes = f.read(65536)
+        enc = _detect_encoding(hdr_bytes)
+        hdr_txt = hdr_bytes.decode(enc, errors="replace")
+        has_hdr = _has_header_from_text(hdr_txt, sep)
+        # DuckDB usa 'latin1' (compatibile con cp1252 per i caratteri DWH italiani)
+        ddb_enc = "latin1" if enc == "cp1252" else "utf-8"
 
-    if log_cb:
-        log_cb(f"    {table.upper()}: completato — {total:,} righe, {len(col_names)} colonne")
-    return col_names, total
+        # ── 3. Leggi prima riga per ricavare nomi colonna raw ──────────────────
+        # DuckDB supporta solo delimitatore a singolo carattere
+        ddb_sep = sep[0]
+
+        with open(actual, encoding=enc, errors="replace") as f:
+            first_line = f.readline().rstrip("\r\n")
+
+        if has_hdr:
+            raw_hdr = _dedup_columns([c.strip() for c in first_line.split(ddb_sep)])
+        else:
+            # DuckDB genera 'column0', 'column1', ... per CSV senza header
+            raw_hdr = [f"column{i}" for i in range(len(first_line.split(ddb_sep)))]
+
+        # ── 4. Calcola strip_str (stesso algoritmo di _strip_sep_prefixes) ─────
+        strip_set = {c for c in sep if not (c.isalnum() or c == "_")}
+        _KNOWN = frozenset("£#;|,@~")
+        for c in raw_hdr:
+            if c and c[0] in _KNOWN and c[0] not in strip_set:
+                cand = c[0]
+                if sum(1 for col in raw_hdr if col.startswith(cand)) >= max(1, len(raw_hdr) * 0.30):
+                    strip_set.add(cand)
+                break
+        strip_str = "".join(sorted(strip_set))
+
+        # ── 5. Calcola nomi colonna normalizzati + mapping raw→norm ───────────
+        clean_names: list[str] = []
+        seen_cnt: dict[str, int] = {}
+        for c in raw_hdr:
+            n = (c.lstrip(strip_str) if strip_str else c) or c
+            if _is_artifact_col(n):
+                clean_names.append(None)   # type: ignore  — colonna da scartare
+                continue
+            if n in seen_cnt:
+                seen_cnt[n] += 1
+                n = f"{n}_{seen_cnt[n]}"
+            else:
+                seen_cnt[n] = 0
+            clean_names.append(n)
+
+        norm_to_raw: dict[str, str] = {
+            n: r for r, n in zip(raw_hdr, clean_names) if n is not None
+        }
+
+        # ── 6. Costruisci SELECT expressions ──────────────────────────────────
+        # TRIM rimuove spazi, LTRIM rimuove il prefisso sep; entrambi in SQL
+        def _val_expr(raw_col: str) -> str:
+            base = f"TRIM({_q(raw_col)})"
+            if strip_str:
+                # LTRIM con lista di caratteri da togliere
+                safe = strip_str.replace("'", "''")   # escape apici (precauzione)
+                base = f"LTRIM(TRIM({_q(raw_col)}), '{safe}')"
+            return base
+
+        col_exprs_parts: list[str] = []
+        for r, n in zip(raw_hdr, clean_names):
+            if n is None:
+                continue   # salta colonne-artefatto
+            expr = f"{_val_expr(r)} AS {_q(n)}"
+            col_exprs_parts.append(expr)
+
+        col_exprs = ",\n    ".join(col_exprs_parts)
+        final_col_names = [n for n in clean_names if n is not None]
+
+        # ── 7. WHERE push-down per row_filter ─────────────────────────────────
+        where_parts: list[str] = []
+        where_params: list[str] = []
+        if row_filter:
+            for fc, fv in row_filter.items():
+                raw_fc = norm_to_raw.get(fc)
+                if raw_fc is None:
+                    # prova ricerca case-insensitive
+                    for n, r in norm_to_raw.items():
+                        if n.lower() == fc.lower():
+                            raw_fc = r
+                            break
+                if raw_fc is not None:
+                    where_parts.append(f"{_val_expr(raw_fc)} = ?")
+                    where_params.append(fv.strip())
+
+        where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+        # ── 8. Carica in DuckDB con reader nativo ─────────────────────────────
+        _log(f"    {table.upper()}: DuckDB native CSV read (C++, parallel)...")
+        conn = _duckdb.connect(db_path)
+        try:
+            conn.execute(f"""
+                CREATE TABLE {_q(table)} AS
+                SELECT
+                    {col_exprs},
+                    1 AS _fc_exists
+                FROM read_csv(
+                    ?,
+                    delim         = ?,
+                    header        = ?,
+                    all_varchar   = true,
+                    encoding      = ?,
+                    ignore_errors = true,
+                    parallel      = true
+                )
+                {where_sql}
+            """, [actual, ddb_sep, has_hdr, ddb_enc] + where_params)
+
+            total = conn.execute(f"SELECT COUNT(*) FROM {_q(table)}").fetchone()[0]
+        finally:
+            conn.close()
+
+        _log(f"    {table.upper()}: completato — {total:,} righe, {len(final_col_names)} colonne")
+        return final_col_names, total
+
+    finally:
+        if tmp_csv:
+            try:
+                os.unlink(tmp_csv)
+            except OSError:
+                pass
 
 
 def _q(name: str) -> str:
