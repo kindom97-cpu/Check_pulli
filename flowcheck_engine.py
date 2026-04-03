@@ -1392,12 +1392,15 @@ def _load_to_duckdb(
                         1 AS _fc_exists
                     FROM read_csv(
                         ?,
-                        delim         = ?,
-                        header        = ?,
-                        all_varchar   = true,
-                        encoding      = ?,
-                        ignore_errors = true,
-                        parallel      = true
+                        delim           = ?,
+                        header          = ?,
+                        all_varchar     = true,
+                        encoding        = ?,
+                        ignore_errors   = true,
+                        null_padding    = true,
+                        strict_mode     = false,
+                        max_line_size   = 20000000,
+                        parallel        = true
                     )
                     {where_sql}
                 """, [actual, ddb_sep, has_hdr, ddb_enc] + where_params)
@@ -1427,6 +1430,7 @@ def _load_to_duckdb(
                                 continue
                         chunk2["_fc_exists"] = 1
                         if first2:
+                            conn2.execute(f'DROP TABLE IF EXISTS {_q(table)}')
                             conn2.execute(f'CREATE TABLE {_q(table)} AS SELECT * FROM chunk2')
                             first2 = False
                         else:
