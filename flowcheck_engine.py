@@ -1264,12 +1264,34 @@ def _load_to_duckdb(
         # ── 4. Calcola strip_str (stesso algoritmo di _strip_sep_prefixes) ─────
         strip_set = {c for c in sep if not (c.isalnum() or c == "_")}
         _KNOWN = frozenset("£#;|,@~")
+
+        # 4a. Rileva prefisso dai nomi colonna (es. "#COMPAGNIA_CD" → strip "#")
         for c in raw_hdr:
             if c and c[0] in _KNOWN and c[0] not in strip_set:
                 cand = c[0]
                 if sum(1 for col in raw_hdr if col.startswith(cand)) >= max(1, len(raw_hdr) * 0.30):
                     strip_set.add(cand)
                 break
+
+        # 4b. Rileva prefisso dai VALORI della prima colonna dati
+        #     (caso: colonne senza prefisso ma valori con prefisso, es. "#00063")
+        #     Legge le prime 30 righe dati per campionare.
+        with open(actual, encoding=enc, errors="replace") as _f:
+            _sample_lines = [_f.readline() for _ in range(32)]
+        _data_start = 1 if has_hdr else 0
+        _sample_vals: list[str] = []
+        for _line in _sample_lines[_data_start: _data_start + 30]:
+            _fields = _line.rstrip("\r\n").split(ddb_sep)
+            if _fields:
+                _sample_vals.append(_fields[0].strip())
+        for _val in _sample_vals:
+            if _val and len(_val) > 1 and _val[0] in _KNOWN and _val[0] not in strip_set:
+                _cand = _val[0]
+                _n_match = sum(1 for v in _sample_vals if v.startswith(_cand))
+                if _n_match >= max(1, len(_sample_vals) * 0.50):
+                    strip_set.add(_cand)
+                break
+
         strip_str = "".join(sorted(strip_set))
 
         # ── 5. Calcola nomi colonna normalizzati + mapping raw→norm ───────────
