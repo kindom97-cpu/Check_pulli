@@ -1084,6 +1084,32 @@ def build_excel_pair(
 _LARGE_FILE_THRESHOLD = 200 * 1024 * 1024   # 200 MB → modalità streaming
 
 
+def cleanup_temp_files(log_cb: "Callable[[str], None] | None" = None) -> int:
+    """
+    Rimuove i file temporanei FlowCheck rimasti in %TEMP% da run precedenti
+    (flowcheck_a_*.duckdb, flowcheck_b_*.duckdb, flowcheck_csv_*.csv).
+    Restituisce il numero di file rimossi.
+    """
+    import tempfile as _tf, glob as _glob
+    tmp_dir = _tf.gettempdir()
+    patterns = [
+        "flowcheck_a_*.duckdb",
+        "flowcheck_b_*.duckdb",
+        "flowcheck_csv_*.csv",
+    ]
+    removed = 0
+    for pat in patterns:
+        for fp in _glob.glob(os.path.join(tmp_dir, pat)):
+            try:
+                os.unlink(fp)
+                removed += 1
+            except OSError:
+                pass
+    if log_cb and removed:
+        log_cb(f"  [PULIZIA] Rimossi {removed} file temporanei da {tmp_dir}")
+    return removed
+
+
 def _source_size(path_str: str) -> int:
     """Dimensione stimata in byte del CSV (decompressa se inside ZIP)."""
     try:
@@ -1245,8 +1271,8 @@ def _load_to_duckdb(
         enc = _detect_encoding(hdr_bytes)
         hdr_txt = hdr_bytes.decode(enc, errors="replace")
         has_hdr = _has_header_from_text(hdr_txt, sep)
-        # DuckDB usa 'latin1' (compatibile con cp1252 per i caratteri DWH italiani)
-        ddb_enc = "latin1" if enc == "cp1252" else "utf-8"
+        # DuckDB 1.5+ usa 'CP1252' (non 'latin1' che non è supportato)
+        ddb_enc = "CP1252" if enc == "cp1252" else "utf-8"
 
         # ── 3. Leggi prima riga per ricavare nomi colonna raw ──────────────────
         # DuckDB supporta solo delimitatore a singolo carattere
@@ -1352,29 +1378,66 @@ def _load_to_duckdb(
         where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
         # ── 8. Carica in DuckDB con reader nativo ─────────────────────────────
-        _log(f"    {table.upper()}: DuckDB native CSV read (C++, parallel)...")
-        conn = _duckdb.connect(db_path)
-        try:
-            conn.execute(f"""
-                CREATE TABLE {_q(table)} AS
-                SELECT
-                    {col_exprs},
-                    1 AS _fc_exists
-                FROM read_csv(
-                    ?,
-                    delim         = ?,
-                    header        = ?,
-                    all_varchar   = true,
-                    encoding      = ?,
-                    ignore_errors = true,
-                    parallel      = true
-                )
-                {where_sql}
-            """, [actual, ddb_sep, has_hdr, ddb_enc] + where_params)
+        _log(f"    {table.upper()}: DuckDB native CSV read (enc={ddb_enc}, sep='{ddb_sep}')...")
 
-            total = conn.execute(f"SELECT COUNT(*) FROM {_q(table)}").fetchone()[0]
-        finally:
-            conn.close()
+        ddb_ok = False
+        total  = 0
+        try:
+            conn = _duckdb.connect(db_path)
+            try:
+                conn.execute(f"""
+                    CREATE TABLE {_q(table)} AS
+                    SELECT
+                        {col_exprs},
+                        1 AS _fc_exists
+                    FROM read_csv(
+                        ?,
+                        delim         = ?,
+                        header        = ?,
+                        all_varchar   = true,
+                        encoding      = ?,
+                        ignore_errors = true,
+                        parallel      = true
+                    )
+                    {where_sql}
+                """, [actual, ddb_sep, has_hdr, ddb_enc] + where_params)
+
+                total = conn.execute(f"SELECT COUNT(*) FROM {_q(table)}").fetchone()[0]
+                ddb_ok = True
+            finally:
+                conn.close()
+        except Exception as _ddb_err:
+            _log(f"    {table.upper()}: [WARN] DuckDB read_csv fallito ({_ddb_err}) — fallback pandas")
+
+        # ── 8b. Fallback pandas se DuckDB ha restituito 0 righe o ha fallito ──
+        if not ddb_ok or total == 0:
+            file_bytes = os.path.getsize(actual) if os.path.exists(actual) else 0
+            if file_bytes > 1024:   # file non vuoto: vale la pena riprovare
+                _log(f"    {table.upper()}: fallback pandas chunking ({file_bytes/1024/1024:.1f} MB)...")
+                conn2 = _duckdb.connect(db_path)
+                first2 = True
+                total2 = 0
+                try:
+                    for cols2, chunk2 in _iter_csv_chunks(actual, sep, 100_000):
+                        if row_filter:
+                            for _fc2, _fv2 in row_filter.items():
+                                if _fc2 in chunk2.columns:
+                                    chunk2 = chunk2[chunk2[_fc2].str.strip() == _fv2.strip()]
+                            if chunk2.empty:
+                                continue
+                        chunk2["_fc_exists"] = 1
+                        if first2:
+                            conn2.execute(f'CREATE TABLE {_q(table)} AS SELECT * FROM chunk2')
+                            first2 = False
+                        else:
+                            conn2.execute(f'INSERT INTO {_q(table)} SELECT * FROM chunk2')
+                        total2 += len(chunk2)
+                        if log_cb and total2 % 400_000 < 100_000:
+                            _log(f"    {table.upper()}: {total2:,} righe (pandas)...")
+                finally:
+                    conn2.close()
+                total = total2
+                final_col_names = cols2 if not first2 else final_col_names  # type: ignore
 
         _log(f"    {table.upper()}: completato — {total:,} righe, {len(final_col_names)} colonne")
         return final_col_names, total
@@ -2209,6 +2272,9 @@ def run_comparison(
             progress_cb(msg)
         else:
             print(msg)
+
+    # Pulizia automatica file temp da run precedenti interrotti
+    cleanup_temp_files(log_cb=_log)
 
     asis_path = Path(asis_path)
     tobe_path = Path(tobe_path)
