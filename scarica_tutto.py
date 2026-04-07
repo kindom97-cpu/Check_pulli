@@ -12,8 +12,15 @@ VARIABILI:
 INSTALLAZIONE (esegui una volta):
   pip install yfinance pandas openpyxl requests
 
-ESECUZIONE:
+ESECUZIONE LOCALE:
   python scarica_tutto.py
+
+ESECUZIONE SU GOOGLE COLAB (raccomandato se sei senza internet):
+  1. Vai su https://colab.research.google.com → Nuovo notebook
+  2. Cella 1:  !pip install yfinance openpyxl -q
+  3. Cella 2:  from google.colab import files; files.upload()   # carica ISIN_IPO.xlsx
+  4. Cella 3:  incolla questo script ed esegui
+  5. Al termine: files.download('dataset_finale.xlsx')
 
 TEMPO STIMATO: 15-25 minuti per 189 aziende
 """
@@ -29,7 +36,8 @@ warnings.filterwarnings("ignore")
 # ══════════════════════════════════════════════
 # CONFIGURAZIONE
 # ══════════════════════════════════════════════
-INPUT_FILE  = "ISIN_IPO.xlsx"
+import os
+INPUT_FILE  = "ISIN_IPO.xlsx" if os.path.exists("ISIN_IPO.xlsx") else "ISIN IPO.xlsx"
 OUTPUT_FILE = "dataset_finale.xlsx"
 
 # ══════════════════════════════════════════════
@@ -40,6 +48,7 @@ print("  DOWNLOAD DATASET IPO-ESG")
 print("═"*60)
 
 from openpyxl import load_workbook
+print(f"  File input: {INPUT_FILE}")
 wb = load_workbook(INPUT_FILE, data_only=True)
 ws = wb.active
 rows = []
@@ -61,22 +70,39 @@ print(f"   Anni IPO: {sorted(df['IPO_YEAR'].unique())}\n")
 # STEP 1: ISIN → TICKER (via OpenFIGI gratuito)
 # ══════════════════════════════════════════════
 def isin_to_ticker(isin):
-    """Converte ISIN in ticker Yahoo Finance usando OpenFIGI API (gratuita)."""
+    """Converte ISIN in ticker Yahoo Finance. Prova OpenFIGI (gratuita), poi fallback."""
+    # --- Tentativo 1: OpenFIGI ---
+    for attempt in range(3):
+        try:
+            url = "https://api.openfigi.com/v3/mapping"
+            headers = {"Content-Type": "application/json"}
+            payload = [{"idType": "ID_ISIN", "idValue": isin}]
+            r = requests.post(url, json=payload, headers=headers, timeout=10)
+            if r.status_code == 429:
+                time.sleep(2 ** attempt)
+                continue
+            if r.status_code == 200:
+                data = r.json()
+                if data and data[0].get("data"):
+                    for item in data[0]["data"]:
+                        if item.get("exchCode") in ["US", "UN", "UQ", "UA", "UW"]:
+                            return item.get("ticker")
+                    return data[0]["data"][0].get("ticker")
+            break
+        except Exception:
+            time.sleep(1)
+
+    # --- Tentativo 2: Yahoo Finance search ---
     try:
-        url = "https://api.openfigi.com/v3/mapping"
-        headers = {"Content-Type": "application/json"}
-        payload = [{"idType": "ID_ISIN", "idValue": isin}]
-        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={isin}&quotesCount=1&newsCount=0"
+        r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code == 200:
-            data = r.json()
-            if data and data[0].get("data"):
-                # Preferisci exchange US
-                for item in data[0]["data"]:
-                    if item.get("exchCode") in ["US", "UN", "UQ", "UA", "UW"]:
-                        return item.get("ticker")
-                return data[0]["data"][0].get("ticker")
+            quotes = r.json().get("quotes", [])
+            if quotes:
+                return quotes[0].get("symbol")
     except Exception:
         pass
+
     return None
 
 print("STEP 1: Conversione ISIN → Ticker...")
@@ -292,8 +318,13 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
     completo = final.dropna(subset=vars_ok)
     completo.to_excel(writer, sheet_name="Regressione", index=False)
 
-    # Foglio 3: Statistiche descrittive
-    final[vars_ok].describe().round(3).to_excel(writer, sheet_name="Statistiche")
+    # Foglio 3: Statistiche descrittive (solo se ci sono colonne numeriche)
+    if vars_ok:
+        final[vars_ok].describe().round(3).to_excel(writer, sheet_name="Statistiche")
+    else:
+        pd.DataFrame({"nota": ["Nessun dato numerico disponibile"]}).to_excel(
+            writer, sheet_name="Statistiche", index=False
+        )
 
     # Foglio 4: Missing values
     miss = final.isnull().sum().reset_index()
